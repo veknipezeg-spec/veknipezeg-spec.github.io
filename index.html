@@ -1,6 +1,9 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+<meta charset="UTF-8"><!DOCTYPE html>
+<html lang="en">
+<head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Universal Video Merger - Free Online Tool to Combine Videos</title>
@@ -498,13 +501,19 @@ if ('serviceWorker' in navigator) {
 }
 
 const webCodecsWorkerCode = `
-importScripts('https://cdn.jsdelivr.net/npm/mp4box@0.4.4/dist/mp4box.all.min.js');
-
 self.onmessage = async (e) => {
   const { type, fileUrl, outWidth, outHeight, targetFPS, targetBitrate, id, hasAudio, videoTrackInfo, audioTrackInfo } = e.data;
   
   if (type === 'process') {
     try {
+      if (typeof MP4Box === 'undefined') {
+        try {
+          importScripts('https://cdn.jsdelivr.net/npm/mp4box@0.4.4/dist/mp4box.all.min.js');
+        } catch (e) {
+          throw new Error('Failed to load MP4Box: ' + e.message);
+        }
+      }
+      
       const { Muxer, ArrayBufferTarget } = await import('https://esm.sh/mp4-muxer@5.0.0');
       
       const target = new ArrayBufferTarget();
@@ -515,16 +524,36 @@ self.onmessage = async (e) => {
         fastStart: 'in-memory'
       });
       
+      let encoderError = null;
+      let decoderError = null;
+
       const videoEncoder = new VideoEncoder({
         output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
-        error: (e) => { throw e; }
+        error: (e) => { encoderError = e; }
       });
-      videoEncoder.configure({
-        codec: 'avc1.640028',
-        width: outWidth, height: outHeight,
-        bitrate: targetBitrate, framerate: targetFPS,
-        hardwareAcceleration: 'prefer-hardware', latencyMode: 'realtime'
-      });
+      
+      let hwFailed = false;
+      try {
+        videoEncoder.configure({
+          codec: 'avc1.640028',
+          width: outWidth, height: outHeight,
+          bitrate: targetBitrate, framerate: targetFPS,
+          hardwareAcceleration: 'prefer-hardware', latencyMode: 'realtime'
+        });
+        if (videoEncoder.state === 'error') throw new Error('Encoder entered error state');
+      } catch(e) {
+        hwFailed = true;
+        try {
+          videoEncoder.configure({
+            codec: 'avc1.640028',
+            width: outWidth, height: outHeight,
+            bitrate: targetBitrate, framerate: targetFPS,
+            hardwareAcceleration: 'prefer-software'
+          });
+        } catch (e2) {
+          throw new Error('Encoder configuration failed for both hardware and software: ' + e2.message);
+        }
+      }
       
       let canvas = new OffscreenCanvas(outWidth, outHeight);
       let gl = canvas.getContext('webgl2', { antialias: false, depth: false, stencil: false, preserveDrawingBuffer: false });
@@ -566,39 +595,65 @@ self.onmessage = async (e) => {
       
       const videoDecoder = new VideoDecoder({
         output: (frame) => {
-          if (frame.codedWidth === outWidth && frame.codedHeight === outHeight) {
-            videoEncoder.encode(frame, { keyFrame: videoEncoder.encodeQueueSize < 2 });
-            frame.close();
-          } else if (useWebGL) {
-            gl.bindTexture(gl.TEXTURE_2D, texture);
-            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame);
-            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-            const newFrame = new VideoFrame(canvas, { timestamp: frame.timestamp });
-            videoEncoder.encode(newFrame, { keyFrame: videoEncoder.encodeQueueSize < 2 });
-            newFrame.close();
-            frame.close();
-          } else {
-            createImageBitmap(frame, { resizeWidth: outWidth, resizeHeight: outHeight }).then(bitmap => {
-              const newFrame = new VideoFrame(bitmap, { timestamp: frame.timestamp });
-              videoEncoder.encode(newFrame, { keyFrame: videoEncoder.encodeQueueSize < 2 });
-              bitmap.close(); newFrame.close(); frame.close();
-            }).catch(() => {
-              ctx.drawImage(frame, 0, 0, outWidth, outHeight);
+          if (encoderError) { frame.close(); return; }
+          let handledAsync = false;
+          try {
+            if (frame.codedWidth === outWidth && frame.codedHeight === outHeight) {
+              videoEncoder.encode(frame, { keyFrame: videoEncoder.encodeQueueSize < 2 });
+            } else if (useWebGL) {
+              gl.bindTexture(gl.TEXTURE_2D, texture);
+              gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame);
+              gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
               const newFrame = new VideoFrame(canvas, { timestamp: frame.timestamp });
               videoEncoder.encode(newFrame, { keyFrame: videoEncoder.encodeQueueSize < 2 });
-              newFrame.close(); frame.close();
-            });
+              newFrame.close();
+            } else {
+              handledAsync = true;
+              const timestamp = frame.timestamp;
+              createImageBitmap(frame, { resizeWidth: outWidth, resizeHeight: outHeight }).then(bitmap => {
+                if (encoderError) { frame.close(); return; }
+                const newFrame = new VideoFrame(bitmap, { timestamp });
+                videoEncoder.encode(newFrame, { keyFrame: videoEncoder.encodeQueueSize < 2 });
+                bitmap.close(); newFrame.close(); frame.close();
+              }).catch(() => {
+                if (encoderError) { frame.close(); return; }
+                ctx.drawImage(frame, 0, 0, outWidth, outHeight);
+                const newFrame = new VideoFrame(canvas, { timestamp });
+                videoEncoder.encode(newFrame, { keyFrame: videoEncoder.encodeQueueSize < 2 });
+                newFrame.close(); frame.close();
+              });
+            }
+          } catch(e) {
+             encoderError = e;
+          } finally {
+             if (!handledAsync) frame.close();
           }
         },
-        error: (e) => { throw e; }
+        error: (e) => { decoderError = e; }
       });
-      videoDecoder.configure({
-        codec: videoTrackInfo.codec,
-        codedWidth: videoTrackInfo.width,
-        codedHeight: videoTrackInfo.height,
-        description: videoTrackInfo.description || undefined,
-        hardwareAcceleration: 'prefer-hardware'
-      });
+      
+      try {
+        videoDecoder.configure({
+          codec: videoTrackInfo.codec,
+          codedWidth: videoTrackInfo.width,
+          codedHeight: videoTrackInfo.height,
+          description: videoTrackInfo.description || undefined,
+          hardwareAcceleration: 'prefer-hardware'
+        });
+        if (videoDecoder.state === 'error') throw new Error('Decoder entered error state');
+      } catch(e) {
+         try {
+           videoDecoder.configure({
+            codec: videoTrackInfo.codec,
+            codedWidth: videoTrackInfo.width,
+            codedHeight: videoTrackInfo.height,
+            description: videoTrackInfo.description || undefined,
+            hardwareAcceleration: 'prefer-software'
+           });
+         } catch (e2) {
+            throw new Error('Decoder configuration failed for both hardware and software: ' + e2.message);
+         }
+      }
       
       let audioDecoder = null;
       let audioEncoder = null;
@@ -606,7 +661,7 @@ self.onmessage = async (e) => {
       if (hasAudio && audioTrackInfo) {
         audioEncoder = new AudioEncoder({
           output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
-          error: (e) => console.warn(e)
+          error: (e) => { console.warn(e); }
         });
         audioEncoder.configure({ codec: 'mp4a.40.2', numberOfChannels: 2, sampleRate: 44100, bitrate: 128000 });
         
@@ -615,7 +670,7 @@ self.onmessage = async (e) => {
             try { audioEncoder.encode(frame); } catch(e) {}
             frame.close();
           },
-          error: (e) => console.warn(e)
+          error: (e) => { console.warn(e); }
         });
         audioDecoder.configure({
           codec: audioTrackInfo.codec,
@@ -627,25 +682,30 @@ self.onmessage = async (e) => {
       const mp4boxFile = MP4Box.createFile();
       
       mp4boxFile.onSamples = (id, user, samples) => {
+        if (decoderError || encoderError) return;
         if (id === videoTrackInfo.id) {
           for (const sample of samples) {
-            const chunk = new EncodedVideoChunk({
-              type: sample.is_sync ? 'key' : 'delta',
-              timestamp: Math.round(sample.cts * 1000000 / sample.timescale),
-              duration: Math.round(sample.duration * 1000000 / sample.timescale),
-              data: sample.data
-            });
-            videoDecoder.decode(chunk);
+            try {
+              const chunk = new EncodedVideoChunk({
+                type: sample.is_sync ? 'key' : 'delta',
+                timestamp: Math.round(sample.cts * 1000000 / sample.timescale),
+                duration: Math.round(sample.duration * 1000000 / sample.timescale),
+                data: sample.data
+              });
+              videoDecoder.decode(chunk);
+            } catch(e) { decoderError = e; break; }
           }
         } else if (audioTrackInfo && id === audioTrackInfo.id && audioDecoder) {
           for (const sample of samples) {
-            const chunk = new EncodedAudioChunk({
-              type: sample.is_sync ? 'key' : 'delta',
-              timestamp: Math.round(sample.cts * 1000000 / sample.timescale),
-              duration: Math.round(sample.duration * 1000000 / sample.timescale),
-              data: sample.data
-            });
-            try { audioDecoder.decode(chunk); } catch(e) {}
+            try {
+              const chunk = new EncodedAudioChunk({
+                type: sample.is_sync ? 'key' : 'delta',
+                timestamp: Math.round(sample.cts * 1000000 / sample.timescale),
+                duration: Math.round(sample.duration * 1000000 / sample.timescale),
+                data: sample.data
+              });
+              audioDecoder.decode(chunk);
+            } catch(e) {}
           }
         }
       };
@@ -655,47 +715,70 @@ self.onmessage = async (e) => {
       mp4boxFile.start();
       
       const response = await fetch(fileUrl);
+      if (!response.body) throw new Error('No response body');
       const reader = response.body.getReader();
       let offset = 0;
       let reading = true;
       
       while (reading) {
+        if (decoderError || encoderError) throw new Error('Codec error: ' + (decoderError || encoderError));
+        
         const { done, value } = await reader.read();
         if (done) { reading = false; break; }
-        value.fileStart = offset;
-        mp4boxFile.appendBuffer(value);
+        
+        // mp4box strictly expects an ArrayBuffer
+        const buffer = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+        buffer.fileStart = offset;
+        mp4boxFile.appendBuffer(buffer);
         offset += value.byteLength;
         
+        let waitCount = 0;
         while (videoDecoder.decodeQueueSize > 15 || videoEncoder.encodeQueueSize > 15) {
+          if (decoderError || encoderError) throw new Error('Codec error during wait');
+          if (videoDecoder.state === 'error' || videoEncoder.state === 'error') throw new Error('Codec entered error state');
           await new Promise(r => setTimeout(r, 5));
+          waitCount++;
+          if (waitCount > 1000) throw new Error('Timeout waiting for codec queue to drain');
         }
       }
       mp4boxFile.flush();
       
-      while (videoDecoder.decodeQueueSize > 0) await new Promise(r => setTimeout(r, 10));
-      await videoDecoder.flush();
-      videoDecoder.close();
+      let flushWait = 0;
+      while (videoDecoder.decodeQueueSize > 0 || videoDecoder.state === 'configured') {
+        if (decoderError || encoderError) break;
+        if (videoDecoder.state === 'error') break;
+        await new Promise(r => setTimeout(r, 10));
+        flushWait++;
+        if (flushWait > 500) break;
+      }
+      try { await videoDecoder.flush(); } catch(e) {}
+      try { videoDecoder.close(); } catch(e) {}
       
       if (audioDecoder) {
-        while (audioDecoder.decodeQueueSize > 0) await new Promise(r => setTimeout(r, 10));
-        await audioDecoder.flush();
-        audioDecoder.close();
+        try { await audioDecoder.flush(); } catch(e) {}
+        try { audioDecoder.close(); } catch(e) {}
       }
       
-      while (videoEncoder.encodeQueueSize > 0) await new Promise(r => setTimeout(r, 10));
-      await videoEncoder.flush();
-      videoEncoder.close();
+      let encWait = 0;
+      while (videoEncoder.encodeQueueSize > 0 || videoEncoder.state === 'configured') {
+        if (encoderError) break;
+        if (videoEncoder.state === 'error') break;
+        await new Promise(r => setTimeout(r, 10));
+        encWait++;
+        if (encWait > 500) break;
+      }
+      try { await videoEncoder.flush(); } catch(e) {}
+      try { videoEncoder.close(); } catch(e) {}
       
       if (audioEncoder) {
-        while (audioEncoder.encodeQueueSize > 0) await new Promise(r => setTimeout(r, 10));
-        await audioEncoder.flush();
-        audioEncoder.close();
+        try { await audioEncoder.flush(); } catch(e) {}
+        try { audioEncoder.close(); } catch(e) {}
       }
       
       await muxer.finalize();
       
-      const buffer = target.buffer;
-      self.postMessage({ type: 'done', id, buffer }, [buffer]);
+      const bufferOut = target.buffer;
+      self.postMessage({ type: 'done', id, buffer: bufferOut }, [bufferOut]);
       
     } catch (err) {
       self.postMessage({ type: 'error', id, msg: err.message || String(err) });
@@ -1291,14 +1374,22 @@ async function processWithWorkerPool(filesList, trackInfos, outWidth, outHeight,
           const trackInfo = trackInfos[idx];
           const fileUrl = URL.createObjectURL(file);
           
+          // Add timeout to prevent infinite hanging if worker dies silently
+          let timeoutId = setTimeout(() => {
+             URL.revokeObjectURL(fileUrl);
+             rejectWorker(new Error('Worker timeout processing file ' + idx));
+          }, 180000); // 3 minute timeout per file
+          
           worker.onmessage = (e) => {
             if (e.data.type === 'done' && e.data.id === idx) {
+              clearTimeout(timeoutId);
               results[idx] = e.data.buffer;
               completed++;
               if (updateProgress) updateProgress(0.50 + (completed / filesList.length) * 0.40, `Parallel hardware encoding: ${completed}/${filesList.length} done`);
               URL.revokeObjectURL(fileUrl);
               processNext();
             } else if (e.data.type === 'error' && e.data.id === idx) {
+              clearTimeout(timeoutId);
               URL.revokeObjectURL(fileUrl);
               rejectWorker(new Error(e.data.msg));
             }
