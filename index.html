@@ -1049,7 +1049,8 @@ async function loadFFmpeg() {
     console.warn("Multi-threaded core failed (expected on GitHub Pages due to missing COOP/COEP headers). Falling back to single-thread...", mtErr);
   }
 
-  const stBaseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm';
+  // FIX: Use 0.12.6 UMD build for stable single-thread fallback
+  const stBaseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd';
   
   try {
     statusEl.textContent = 'Loading FFmpeg (Single-Threaded)...';
