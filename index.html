@@ -238,7 +238,6 @@
 </style>
 
 <script src="https://cdn.jsdelivr.net/npm/mp4box@0.4.4/dist/mp4box.all.min.js"></script>
-<!-- FIXED: Changed ffmpeg.min.js to ffmpeg.js (minified version doesn't exist in v0.12.x) -->
 <script src="https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js"></script>
 </head>
 <body>
@@ -757,7 +756,6 @@ function getFFmpeg() {
   return ffmpeg;
 }
 
-// A safe, standalone helper that doesn't rely on the restricted Cache API
 async function toBlobURL(url, mimeType) {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`Failed to fetch: ${url}`);
@@ -765,7 +763,6 @@ async function toBlobURL(url, mimeType) {
   return URL.createObjectURL(new Blob([blob], { type: mimeType }));
 }
 
-// FIX: Bundles the required FFmpeg worker logic into a Blob URL to bypass localhost CORS restrictions
 async function createBundledWorkerURL() {
   const workerCode = `
     const MIME_TYPE_JAVASCRIPT = "text/javascript";
@@ -902,7 +899,6 @@ async function createBundledWorkerURL() {
   return URL.createObjectURL(blob);
 }
 
-// UPDATED: Now attempts multi-threading first, and gracefully falls back to single-thread for GitHub Pages
 async function loadFFmpeg() {
   if (ffmpegLoaded) return;
   
@@ -922,11 +918,8 @@ async function loadFFmpeg() {
     progress.value = percent;
   });
 
-  // FIX: Create a bundled module worker to bypass CORS restrictions for cross-origin workers on localhost
   const classWorkerURL = await createBundledWorkerURL();
 
-  // 1. ATTEMPT MULTI-THREADED CORE
-  // Requires Cross-Origin-Opener-Policy and Cross-Origin-Embedder-Policy headers (GitHub Pages doesn't support these, so it will likely fail)
   const mtBaseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core-mt@0.12.10/dist/esm';
   
   try {
@@ -935,21 +928,18 @@ async function loadFFmpeg() {
       coreURL: await toBlobURL(`${mtBaseURL}/ffmpeg-core.js`, 'text/javascript'),
       wasmURL: await toBlobURL(`${mtBaseURL}/ffmpeg-core.wasm`, 'application/wasm'),
       workerURL: await toBlobURL(`${mtBaseURL}/ffmpeg-core.worker.js`, 'text/javascript'),
-      classWorkerURL // Pass custom worker to bypass CORS
+      classWorkerURL
     });
     
     ffmpegLoaded = true;
     statusEl.textContent = 'FFmpeg Multi-Threaded ready';
     console.log("Loaded Multi-Threaded FFmpeg Core");
-    return; // Success, exit function
+    return;
     
   } catch (mtErr) {
     console.warn("Multi-threaded core failed (expected on GitHub Pages due to missing COOP/COEP headers). Falling back to single-thread...", mtErr);
   }
 
-  // 2. FALLBACK TO SINGLE-THREADED CORE
-  // This works perfectly on GitHub Pages without any special server configuration
-  // FIX: Changed /dist/umd to /dist/esm so the module worker can successfully import() the core
   const stBaseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm';
   
   try {
@@ -957,7 +947,7 @@ async function loadFFmpeg() {
     await ffmpegInstance.load({
       coreURL: await toBlobURL(`${stBaseURL}/ffmpeg-core.js`, 'text/javascript'),
       wasmURL: await toBlobURL(`${stBaseURL}/ffmpeg-core.wasm`, 'application/wasm'),
-      classWorkerURL // Pass custom worker to bypass CORS
+      classWorkerURL
     });
     
     ffmpegLoaded = true;
@@ -1500,7 +1490,18 @@ mergeBtn.addEventListener('click', async () => {
     
     const allMP4AndCompatible = currentFiles.every((f, idx) => {
       const t = trackInfos[idx];
-      return t.isMP4 && t.parsed === true && t.hasVideo;
+      if (!t.isMP4 || !t.parsed || !t.hasVideo || !t.videoTrack) return false;
+      
+      // Ensure video is H.264 (AVC) and audio is AAC (or absent) for safe stream copy
+      const isAvc = t.videoTrack.codec && t.videoTrack.codec.startsWith('avc');
+      if (!isAvc) return false;
+      
+      if (t.hasAudio && t.audioTrack) {
+        const isAac = t.audioTrack.codec && t.audioTrack.codec.startsWith('mp4a');
+        if (!isAac) return false;
+      }
+      
+      return true;
     });
     
     if (allMP4AndCompatible && supportsWebCodecs) {
@@ -1524,47 +1525,66 @@ mergeBtn.addEventListener('click', async () => {
           progress.value = 20 + ((fileIdx + 0.5) / currentFiles.length) * 70;
           
           const buffer = await readFileSlice(currentFiles[fileIdx], 0, currentFiles[fileIdx].size);
-          const mp4boxFile = MP4Box.createFile();
-          buffer.fileStart = 0;
-          mp4boxFile.appendBuffer(buffer);
-          mp4boxFile.flush();
           
-          await new Promise((resolve) => {
+          await new Promise((resolve, reject) => {
+            const mp4boxFile = MP4Box.createFile();
+            let maxVideoTs = 0;
+            let maxAudioTs = 0;
+            
             mp4boxFile.onReady = (info) => {
               const videoTrack = info.tracks.find(t => t.type === 'video');
               const audioTrack = info.tracks.find(t => t.type === 'audio');
               
-              let maxVideoTs = 0;
-              let maxAudioTs = 0;
+              if (videoTrack) mp4boxFile.setExtractionOptions(videoTrack.id, null, { nbSamples: 1000000 });
+              if (audioTrack) mp4boxFile.setExtractionOptions(audioTrack.id, null, { nbSamples: 1000000 });
               
-              const mp4boxFile2 = MP4Box.createFile();
-              mp4boxFile2.onSamples = (id, user, samples) => {
-                if (id === videoTrack.id) {
+              mp4boxFile.onSamples = (id, user, samples) => {
+                if (videoTrack && id === videoTrack.id) {
                   for (const sample of samples) {
                     const ts = baseTimestamp + Math.round(sample.cts * 1000000 / sample.timescale);
                     const dur = Math.round(sample.duration * 1000000 / sample.timescale);
-                    maxVideoTs = ts + dur;
-                    muxer.addVideoChunk(new EncodedVideoChunk({ type: sample.is_sync ? 'key' : 'delta', timestamp: ts, duration: dur, data: sample.data }));
+                    maxVideoTs = Math.max(maxVideoTs, ts + dur);
+                    try {
+                      muxer.addVideoChunk(new EncodedVideoChunk({ 
+                        type: sample.is_sync ? 'key' : 'delta', 
+                        timestamp: ts, 
+                        duration: dur, 
+                        data: sample.data 
+                      }));
+                    } catch(e) { console.warn("Video chunk error:", e); }
                   }
                 } else if (audioTrack && id === audioTrack.id) {
                   for (const sample of samples) {
                     const ts = baseTimestamp + Math.round(sample.cts * 1000000 / sample.timescale);
                     const dur = Math.round(sample.duration * 1000000 / sample.timescale);
-                    maxAudioTs = ts + dur;
-                    muxer.addAudioChunk(new EncodedAudioChunk({ type: sample.is_sync ? 'key' : 'delta', timestamp: ts, duration: dur, data: sample.data }));
+                    maxAudioTs = Math.max(maxAudioTs, ts + dur);
+                    try {
+                      muxer.addAudioChunk(new EncodedAudioChunk({ 
+                        type: sample.is_sync ? 'key' : 'delta', 
+                        timestamp: ts, 
+                        duration: dur, 
+                        data: sample.data 
+                      }));
+                    } catch(e) { console.warn("Audio chunk error:", e); }
                   }
                 }
               };
-              mp4boxFile2.setExtractionOptions(videoTrack.id, null, { nbSamples: 1000000 });
-              if (audioTrack) mp4boxFile2.setExtractionOptions(audioTrack.id, null, { nbSamples: 1000000 });
-              mp4boxFile2.onReady = () => { mp4boxFile2.start(); setTimeout(resolve, 100); };
-              buffer.fileStart = 0;
-              mp4boxFile2.appendBuffer(buffer);
-              mp4boxFile2.flush();
-              mp4boxFile2.start();
+              
+              mp4boxFile.start();
             };
+            
+            mp4boxFile.onError = (e) => reject(e);
+            
+            buffer.fileStart = 0;
+            mp4boxFile.appendBuffer(buffer);
+            mp4boxFile.flush();
+            
+            // Wait for synchronous onSamples calls to finish
+            setTimeout(() => {
+              baseTimestamp = Math.max(baseTimestamp, maxVideoTs, maxAudioTs);
+              resolve();
+            }, 50);
           });
-          baseTimestamp = Math.max(baseTimestamp, maxVideoTs, maxAudioTs);
         }
         await muxer.finalize();
         const blob = new Blob([target.buffer], { type: 'video/mp4' });
