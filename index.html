@@ -1350,32 +1350,41 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
          const tsName = `fallback_${idx}.ts`;
          const videoFilter = `scale=${outWidth}:${outHeight}:force_original_aspect_ratio=decrease,pad=${outWidth}:${outHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${targetFPS}`;
          
-         let args = [
-           '-fflags', '+genpts', '-i', filePath, '-vf', videoFilter,
-           '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-crf', '28', '-pix_fmt', 'yuv420p'
-         ];
+         // --- FIX: Corrected FFmpeg argument order ---
+         // All inputs (-i) MUST come BEFORE output options and mappings.
+         let args = ['-fflags', '+genpts', '-i', filePath];
+         
+         if (!trackInfo.hasAudio) {
+           args.push('-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo');
+         }
+         
+         args.push('-map', '0:v:0');
+         if (trackInfo.hasAudio) {
+           args.push('-map', '0:a:0');
+         } else {
+           args.push('-map', '1:a:0');
+         }
+         
+         args.push('-vf', videoFilter);
+         args.push('-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-crf', '28', '-pix_fmt', 'yuv420p');
+         
          if (trackInfo.hasAudio) {
            args.push('-af', 'aresample=44100,aformat=channel_layouts=stereo');
-           args.push('-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k');
-           args.push('-map', '0:v:0', '-map', '0:a:0');
-         } else {
-           // --- FIX: Removed "-t 3600" which caused 1-hour silent audio allocation and hangs ---
-           args.push('-f', 'lavfi', '-i', `anullsrc=r=44100:cl=stereo`);
-           args.push('-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k');
-           args.push('-map', '0:v:0', '-map', '1:a:0');
          }
+         args.push('-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k');
+         
          args.push('-shortest', '-f', 'mpegts', '-y', tsName);
          
          let code = await ffmpegInstance.exec(args);
          
-         if (code !== 0 && trackInfo.hasAudio) {
+         if (code !== 0) {
              const retryArgs = [
                '-fflags', '+genpts', '-i', filePath,
-               '-f', 'lavfi', '-i', `anullsrc=r=44100:cl=stereo`,
+               '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
+               '-map', '0:v:0', '-map', '1:a:0',
                '-vf', videoFilter,
                '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-crf', '28', '-pix_fmt', 'yuv420p',
                '-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k',
-               '-map', '0:v:0', '-map', '1:a:0',
                '-shortest', '-f', 'mpegts', '-y', tsName
              ];
              code = await ffmpegInstance.exec(retryArgs);
