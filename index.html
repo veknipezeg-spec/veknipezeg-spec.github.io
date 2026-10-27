@@ -238,7 +238,6 @@
 </style>
 
 <script src="https://cdn.jsdelivr.net/npm/mp4box@0.4.4/dist/mp4box.all.min.js" crossorigin="anonymous"></script>
-<script src="https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js" crossorigin="anonymous"></script>
 </head>
 <body>
 
@@ -841,6 +840,55 @@ const logEl = document.getElementById('log');
 const counter = document.getElementById('counter');
 const resolution = document.getElementById('resolution');
 const warning = document.getElementById('warning');
+
+// --- NEW: DYNAMIC FFMPEG WRAPPER PATCHER ---
+async function loadFFmpegLibrary() {
+    if (window.__FFMPEG_LIB_LOADED__) return;
+    window.__FFMPEG_LIB_LOADED__ = true;
+
+    const ffmpegUrl = "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js";
+    try {
+        const ffmpegResp = await fetch(ffmpegUrl);
+        if (!ffmpegResp.ok) throw new Error("Failed to fetch ffmpeg.js");
+        let ffmpegJS = await ffmpegResp.text();
+
+        const chunkMatch = ffmpegJS.match(/u\((\d+)\)/);
+        if (chunkMatch) {
+            const chunkId = chunkMatch[1];
+            const workerUrl = `https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/${chunkId}.ffmpeg.js`;
+            const workerResp = await fetch(workerUrl);
+            if (!workerResp.ok) throw new Error("Failed to fetch ffmpeg worker chunk");
+            const workerBlob = await workerResp.blob();
+            window.__FFMPEG_WORKER_URL__ = URL.createObjectURL(workerBlob);
+            
+            // Replace the cross-origin worker creation with our local blob URL
+            ffmpegJS = ffmpegJS.replace(/new URL\(e\.p\+e\.u\(\d+\),e\.b\)/g, 'window.__FFMPEG_WORKER_URL__');
+            
+            // Inject as a blob script to bypass any CSP inline-script restrictions
+            const modifiedBlob = new Blob([ffmpegJS], { type: 'application/javascript' });
+            const scriptUrl = URL.createObjectURL(modifiedBlob);
+            
+            const script = document.createElement('script');
+            script.src = scriptUrl;
+            document.head.appendChild(script);
+            
+            await new Promise(r => setTimeout(r, 50));
+        } else {
+            console.warn("Could not find ffmpeg worker chunk ID in UMD build. Falling back to direct script tag.");
+            const script = document.createElement('script');
+            script.src = ffmpegUrl;
+            script.crossOrigin = "anonymous";
+            document.head.appendChild(script);
+            await new Promise(r => setTimeout(r, 500));
+        }
+    } catch (e) {
+        console.error("Failed to dynamically load ffmpeg.js library", e);
+    }
+}
+
+// Must run before FFmpeg instances are created
+await loadFFmpegLibrary();
+// -------------------------------------------
 
 function getErrorMessage(err) {
   if (!err) return 'Unknown error';
