@@ -5,6 +5,10 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0"><!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Universal Video Merger - Free Online Tool to Combine Videos</title>
 <meta name="description" content="Merge unlimited videos of any format, codec, or resolution online for free. No upload, no watermarks, works directly in your browser.">
@@ -1350,7 +1354,8 @@ async function processWithWorkerPool(filesList, trackInfos, outWidth, outHeight,
   const workerBlob = new Blob([webCodecsWorkerCode], { type: 'text/javascript' });
   const workerUrl = URL.createObjectURL(workerBlob);
   
-  const MAX_WORKERS = Math.min(filesList.length, navigator.hardwareConcurrency || 4);
+  // Limit to max 3 concurrent workers regardless of hardware concurrency
+  const MAX_WORKERS = Math.min(filesList.length, 3);
   const workers = [];
   for (let i = 0; i < MAX_WORKERS; i++) {
     workers.push(new Worker(workerUrl));
@@ -1442,7 +1447,8 @@ async function finalConcatTS(results, updateProgress) {
     ]);
     if (code !== 0) throw new Error(`TS remux failed for worker output ${i}`);
     tsFiles.push(tsName);
-    ffmpegInstance.deleteFile(mp4Name).catch(()=>{});
+    // Delete the intermediate MP4 immediately to free memory
+    try { await ffmpegInstance.deleteFile(mp4Name); } catch(e) {}
   }
   
   if (updateProgress) updateProgress(0.95, 'Concatenating TS streams...');
@@ -1734,48 +1740,14 @@ mergeBtn.addEventListener('click', async () => {
   const [outWidth, outHeight] = resolution.value.split(':');
 
   try {
-    const BATCH_SIZE = 3;
-    const batches = [];
-    for (let i = 0; i < files.length; i += BATCH_SIZE) {
-      batches.push(files.slice(i, i + BATCH_SIZE));
-    }
-
-    const intermediateFiles = [];
-    
-    for (let b = 0; b < batches.length; b++) {
-      const batchFiles = batches[b];
-      
-      const startProg = (b / batches.length) * 90;
-      const endProg = ((b + 1) / batches.length) * 90;
-      const progDiff = endProg - startProg;
-      
-      const updateProgress = (ratio, msg) => {
-        progress.value = startProg + Math.min(ratio, 1.0) * progDiff;
-        statusEl.textContent = `Batch ${b + 1}/${batches.length}: ${msg}`;
-      };
-      
-      updateProgress(0, 'Starting batch...');
-      const batchBlob = await mergeBatch(batchFiles, outWidth, outHeight, updateProgress);
-      const batchFile = new File([batchBlob], `batch_${b}_${Date.now()}.mp4`, { type: 'video/mp4' });
-      intermediateFiles.push(batchFile);
-    }
-
-    statusEl.textContent = `Compiling final video from ${intermediateFiles.length} batches...`;
-    
-    const finalUpdateProgress = (ratio, msg) => {
-      progress.value = 90 + Math.min(ratio, 1.0) * 10;
-      statusEl.textContent = `Final Compilation: ${msg}`;
+    const updateProgress = (ratio, msg) => {
+      progress.value = Math.min(ratio, 1.0) * 100;
+      statusEl.textContent = msg;
     };
     
-    let finalBlob;
-    if (intermediateFiles.length === 1) {
-      finalBlob = intermediateFiles[0];
-      finalUpdateProgress(1.0, 'Done! (Single batch processed)');
-    } else {
-      finalUpdateProgress(0, 'Starting final pass...');
-      finalBlob = await mergeBatch(intermediateFiles, outWidth, outHeight, finalUpdateProgress);
-      finalUpdateProgress(1.0, 'Done!');
-    }
+    updateProgress(0, 'Starting merge process...');
+    // Pass the entire array of files to mergeBatch at once for a continuous pipeline
+    const finalBlob = await mergeBatch(files, outWidth, outHeight, updateProgress);
     
     outputBlobUrl = URL.createObjectURL(finalBlob);
     download.href = outputBlobUrl;
