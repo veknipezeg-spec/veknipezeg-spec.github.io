@@ -483,21 +483,7 @@
   <p>A free, privacy-first video tool. No uploads. No watermarks. No accounts required.</p>
 </footer>
 
-<script type="module">
-import { Muxer, ArrayBufferTarget } from 'https://esm.sh/mp4-muxer@5.0.0';
-
-const supportsWebCodecs = 'VideoEncoder' in window && 'VideoDecoder' in window && 'AudioEncoder' in window && 'AudioDecoder' in window;
-const isAndroid = /Android/i.test(navigator.userAgent) || /Mobile/i.test(navigator.userAgent);
-
-if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.getRegistrations().then(registrations => {
-    for (const registration of registrations) {
-      registration.unregister();
-    }
-  });
-}
-
-const webCodecsWorkerCode = `
+<script id="webcodecs-worker-code" type="text/plain">
 self.onmessage = async (e) => {
   const { type, fileUrl, outWidth, outHeight, targetFPS, targetBitrate, id, hasAudio } = e.data;
   
@@ -554,12 +540,12 @@ self.onmessage = async (e) => {
       
       if (gl) {
         try {
-          const vsSource = \`#version 300 es
+          const vsSource = `#version 300 es
           in vec2 a_pos; in vec2 a_tex; out vec2 v_tex;
-          void main() { gl_Position = vec4(a_pos, 0, 1); v_tex = a_tex; }\`;
-          const fsSource = \`#version 300 es
+          void main() { gl_Position = vec4(a_pos, 0, 1); v_tex = a_tex; }`;
+          const fsSource = `#version 300 es
           precision mediump float; in vec2 v_tex; out vec4 o; uniform sampler2D u;
-          void main() { o = texture(u, v_tex); }\`;
+          void main() { o = texture(u, v_tex); }`;
           
           const vs = gl.createShader(gl.VERTEX_SHADER); gl.shaderSource(vs, vsSource); gl.compileShader(vs);
           const fs = gl.createShader(gl.FRAGMENT_SHADER); gl.shaderSource(fs, fsSource); gl.compileShader(fs);
@@ -809,7 +795,153 @@ self.onmessage = async (e) => {
     }
   }
 };
-`;
+</script>
+
+<script id="ffmpeg-worker-code" type="text/plain">
+    const MIME_TYPE_JAVASCRIPT = "text/javascript";
+    const MIME_TYPE_WASM = "application/wasm";
+    const CORE_VERSION = "0.12.10";
+    const CORE_URL = `https://unpkg.com/@ffmpeg/core@${CORE_VERSION}/dist/umd/ffmpeg-core.js`;
+    var FFMessageType;
+    (function (FFMessageType) {
+        FFMessageType["LOAD"] = "LOAD";
+        FFMessageType["EXEC"] = "EXEC";
+        FFMessageType["WRITE_FILE"] = "WRITE_FILE";
+        FFMessageType["READ_FILE"] = "READ_FILE";
+        FFMessageType["DELETE_FILE"] = "DELETE_FILE";
+        FFMessageType["RENAME"] = "RENAME";
+        FFMessageType["CREATE_DIR"] = "CREATE_DIR";
+        FFMessageType["LIST_DIR"] = "LIST_DIR";
+        FFMessageType["DELETE_DIR"] = "DELETE_DIR";
+        FFMessageType["ERROR"] = "ERROR";
+        FFMessageType["DOWNLOAD"] = "DOWNLOAD";
+        FFMessageType["PROGRESS"] = "PROGRESS";
+        FFMessageType["LOG"] = "LOG";
+        FFMessageType["MOUNT"] = "MOUNT";
+        FFMessageType["UNMOUNT"] = "UNMOUNT";
+    })(FFMessageType || (FFMessageType = {}));
+
+    const ERROR_UNKNOWN_MESSAGE_TYPE = new Error("unknown message type");
+    const ERROR_NOT_LOADED = new Error("ffmpeg is not loaded, call `await ffmpeg.load()` first");
+    const ERROR_TERMINATED = new Error("called FFmpeg.terminate()");
+    const ERROR_IMPORT_FAILURE = new Error("failed to import ffmpeg-core.js");
+
+    let ffmpeg;
+    const load = async ({ coreURL: _coreURL, wasmURL: _wasmURL, workerURL: _workerURL }) => {
+        const first = !ffmpeg;
+        try {
+            if (!_coreURL) _coreURL = CORE_URL;
+            importScripts(_coreURL);
+        } catch {
+            if (!_coreURL) _coreURL = CORE_URL.replace('/umd/', '/esm/');
+            self.createFFmpegCore = (await import(_coreURL)).default;
+            if (!self.createFFmpegCore) {
+                throw ERROR_IMPORT_FAILURE;
+            }
+        }
+        const coreURL = _coreURL;
+        const wasmURL = _wasmURL ? _wasmURL : _coreURL.replace(/.js$/g, ".wasm");
+        const workerURL = _workerURL ? _workerURL : _coreURL.replace(/.js$/g, ".worker.js");
+        ffmpeg = await self.createFFmpegCore({
+            mainScriptUrlOrBlob: `${coreURL}#${btoa(JSON.stringify({ wasmURL, workerURL }))}`,
+        });
+        ffmpeg.setLogger((data) => self.postMessage({ type: FFMessageType.LOG, data }));
+        ffmpeg.setProgress((data) => self.postMessage({
+            type: FFMessageType.PROGRESS,
+            data,
+        }));
+        return first;
+    };
+    const exec = ({ args, timeout = -1 }) => {
+        ffmpeg.setTimeout(timeout);
+        ffmpeg.exec(...args);
+        const ret = ffmpeg.ret;
+        ffmpeg.reset();
+        return ret;
+    };
+    const writeFile = ({ path, data }) => {
+        ffmpeg.FS.writeFile(path, data);
+        return true;
+    };
+    const readFile = ({ path, encoding }) => ffmpeg.FS.readFile(path, { encoding });
+    const deleteFile = ({ path }) => {
+        ffmpeg.FS.unlink(path);
+        return true;
+    };
+    const rename = ({ oldPath, newPath }) => {
+        ffmpeg.FS.rename(oldPath, newPath);
+        return true;
+    };
+    const createDir = ({ path }) => {
+        ffmpeg.FS.mkdir(path);
+        return true;
+    };
+    const listDir = ({ path }) => {
+        const names = ffmpeg.FS.readdir(path);
+        const nodes = [];
+        for (const name of names) {
+            const stat = ffmpeg.FS.stat(`${path}/${name}`);
+            const isDir = ffmpeg.FS.isDir(stat.mode);
+            nodes.push({ name, isDir });
+        }
+        return nodes;
+    };
+    const deleteDir = ({ path }) => {
+        ffmpeg.FS.rmdir(path);
+        return true;
+    };
+    const mount = ({ fsType, options, mountPoint }) => {
+        const str = fsType;
+        const fs = ffmpeg.FS.filesystems[str];
+        if (!fs) return false;
+        ffmpeg.FS.mount(fs, options, mountPoint);
+        return true;
+    };
+    const unmount = ({ mountPoint }) => {
+        ffmpeg.FS.unmount(mountPoint);
+        return true;
+    };
+    self.onmessage = async ({ data: { id, type, data: _data } }) => {
+        const trans = [];
+        let data;
+        try {
+            if (type !== FFMessageType.LOAD && !ffmpeg) throw ERROR_NOT_LOADED;
+            switch (type) {
+                case FFMessageType.LOAD: data = await load(_data); break;
+                case FFMessageType.EXEC: data = exec(_data); break;
+                case FFMessageType.WRITE_FILE: data = writeFile(_data); break;
+                case FFMessageType.READ_FILE: data = readFile(_data); break;
+                case FFMessageType.DELETE_FILE: data = deleteFile(_data); break;
+                case FFMessageType.RENAME: data = rename(_data); break;
+                case FFMessageType.CREATE_DIR: data = createDir(_data); break;
+                case FFMessageType.LIST_DIR: data = listDir(_data); break;
+                case FFMessageType.DELETE_DIR: data = deleteDir(_data); break;
+                case FFMessageType.MOUNT: data = mount(_data); break;
+                case FFMessageType.UNMOUNT: data = unmount(_data); break;
+                default: throw ERROR_UNKNOWN_MESSAGE_TYPE;
+            }
+        } catch (e) {
+            self.postMessage({ id, type: FFMessageType.ERROR, data: e.toString() });
+            return;
+        }
+        if (data instanceof Uint8Array) trans.push(data.buffer);
+        self.postMessage({ id, type, data }, trans);
+    };
+</script>
+
+<script type="module">
+const supportsWebCodecs = 'VideoEncoder' in window && 'VideoDecoder' in window && 'AudioEncoder' in window && 'AudioDecoder' in window;
+const isAndroid = /Android/i.test(navigator.userAgent) || /Mobile/i.test(navigator.userAgent);
+
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.getRegistrations().then(registrations => {
+    for (const registration of registrations) {
+      registration.unregister();
+    }
+  });
+}
+
+const webCodecsWorkerCode = document.getElementById('webcodecs-worker-code').textContent;
 
 let files = [];
 let outputBlobUrl = null;
@@ -865,143 +997,13 @@ function getFFmpeg() {
 
 async function toBlobURL(url, mimeType) {
   const response = await fetch(url);
-  if (!response.ok) throw new Error(\`Failed to fetch: \${url}\`);
+  if (!response.ok) throw new Error(`Failed to fetch: ${url}`);
   const blob = await response.blob();
   return URL.createObjectURL(new Blob([blob], { type: mimeType }));
 }
 
-async function createBundledWorkerURL() {
-  const workerCode = `
-    const MIME_TYPE_JAVASCRIPT = "text/javascript";
-    const MIME_TYPE_WASM = "application/wasm";
-    const CORE_VERSION = "0.12.10";
-    const CORE_URL = \`https://unpkg.com/@ffmpeg/core@\${CORE_VERSION}/dist/umd/ffmpeg-core.js\`;
-    var FFMessageType;
-    (function (FFMessageType) {
-        FFMessageType["LOAD"] = "LOAD";
-        FFMessageType["EXEC"] = "EXEC";
-        FFMessageType["WRITE_FILE"] = "WRITE_FILE";
-        FFMessageType["READ_FILE"] = "READ_FILE";
-        FFMessageType["DELETE_FILE"] = "DELETE_FILE";
-        FFMessageType["RENAME"] = "RENAME";
-        FFMessageType["CREATE_DIR"] = "CREATE_DIR";
-        FFMessageType["LIST_DIR"] = "LIST_DIR";
-        FFMessageType["DELETE_DIR"] = "DELETE_DIR";
-        FFMessageType["ERROR"] = "ERROR";
-        FFMessageType["DOWNLOAD"] = "DOWNLOAD";
-        FFMessageType["PROGRESS"] = "PROGRESS";
-        FFMessageType["LOG"] = "LOG";
-        FFMessageType["MOUNT"] = "MOUNT";
-        FFMessageType["UNMOUNT"] = "UNMOUNT";
-    })(FFMessageType || (FFMessageType = {}));
-
-    const ERROR_UNKNOWN_MESSAGE_TYPE = new Error("unknown message type");
-    const ERROR_NOT_LOADED = new Error("ffmpeg is not loaded, call \`await ffmpeg.load()\` first");
-    const ERROR_TERMINATED = new Error("called FFmpeg.terminate()");
-    const ERROR_IMPORT_FAILURE = new Error("failed to import ffmpeg-core.js");
-
-    let ffmpeg;
-    const load = async ({ coreURL: _coreURL, wasmURL: _wasmURL, workerURL: _workerURL }) => {
-        const first = !ffmpeg;
-        try {
-            if (!_coreURL) _coreURL = CORE_URL;
-            importScripts(_coreURL);
-        } catch {
-            if (!_coreURL) _coreURL = CORE_URL.replace('/umd/', '/esm/');
-            self.createFFmpegCore = (await import(_coreURL)).default;
-            if (!self.createFFmpegCore) {
-                throw ERROR_IMPORT_FAILURE;
-            }
-        }
-        const coreURL = _coreURL;
-        const wasmURL = _wasmURL ? _wasmURL : _coreURL.replace(/.js$/g, ".wasm");
-        const workerURL = _workerURL ? _workerURL : _coreURL.replace(/.js$/g, ".worker.js");
-        ffmpeg = await self.createFFmpegCore({
-            mainScriptUrlOrBlob: \`\${coreURL}#\${btoa(JSON.stringify({ wasmURL, workerURL }))}\`,
-        });
-        ffmpeg.setLogger((data) => self.postMessage({ type: FFMessageType.LOG, data }));
-        ffmpeg.setProgress((data) => self.postMessage({
-            type: FFMessageType.PROGRESS,
-            data,
-        }));
-        return first;
-    };
-    const exec = ({ args, timeout = -1 }) => {
-        ffmpeg.setTimeout(timeout);
-        ffmpeg.exec(...args);
-        const ret = ffmpeg.ret;
-        ffmpeg.reset();
-        return ret;
-    };
-    const writeFile = ({ path, data }) => {
-        ffmpeg.FS.writeFile(path, data);
-        return true;
-    };
-    const readFile = ({ path, encoding }) => ffmpeg.FS.readFile(path, { encoding });
-    const deleteFile = ({ path }) => {
-        ffmpeg.FS.unlink(path);
-        return true;
-    };
-    const rename = ({ oldPath, newPath }) => {
-        ffmpeg.FS.rename(oldPath, newPath);
-        return true;
-    };
-    const createDir = ({ path }) => {
-        ffmpeg.FS.mkdir(path);
-        return true;
-    };
-    const listDir = ({ path }) => {
-        const names = ffmpeg.FS.readdir(path);
-        const nodes = [];
-        for (const name of names) {
-            const stat = ffmpeg.FS.stat(\`\${path}/\${name}\`);
-            const isDir = ffmpeg.FS.isDir(stat.mode);
-            nodes.push({ name, isDir });
-        }
-        return nodes;
-    };
-    const deleteDir = ({ path }) => {
-        ffmpeg.FS.rmdir(path);
-        return true;
-    };
-    const mount = ({ fsType, options, mountPoint }) => {
-        const str = fsType;
-        const fs = ffmpeg.FS.filesystems[str];
-        if (!fs) return false;
-        ffmpeg.FS.mount(fs, options, mountPoint);
-        return true;
-    };
-    const unmount = ({ mountPoint }) => {
-        ffmpeg.FS.unmount(mountPoint);
-        return true;
-    };
-    self.onmessage = async ({ data: { id, type, data: _data } }) => {
-        const trans = [];
-        let data;
-        try {
-            if (type !== FFMessageType.LOAD && !ffmpeg) throw ERROR_NOT_LOADED;
-            switch (type) {
-                case FFMessageType.LOAD: data = await load(_data); break;
-                case FFMessageType.EXEC: data = exec(_data); break;
-                case FFMessageType.WRITE_FILE: data = writeFile(_data); break;
-                case FFMessageType.READ_FILE: data = readFile(_data); break;
-                case FFMessageType.DELETE_FILE: data = deleteFile(_data); break;
-                case FFMessageType.RENAME: data = rename(_data); break;
-                case FFMessageType.CREATE_DIR: data = createDir(_data); break;
-                case FFMessageType.LIST_DIR: data = listDir(_data); break;
-                case FFMessageType.DELETE_DIR: data = deleteDir(_data); break;
-                case FFMessageType.MOUNT: data = mount(_data); break;
-                case FFMessageType.UNMOUNT: data = unmount(_data); break;
-                default: throw ERROR_UNKNOWN_MESSAGE_TYPE;
-            }
-        } catch (e) {
-            self.postMessage({ id, type: FFMessageType.ERROR, data: e.toString() });
-            return;
-        }
-        if (data instanceof Uint8Array) trans.push(data.buffer);
-        self.postMessage({ id, type, data }, trans);
-    };
-  `;
+function createBundledWorkerURL() {
+  const workerCode = document.getElementById('ffmpeg-worker-code').textContent;
   const blob = new Blob([workerCode], { type: 'text/javascript' });
   return URL.createObjectURL(blob);
 }
@@ -1025,16 +1027,16 @@ async function loadFFmpeg() {
     progress.value = percent;
   });
 
-  const classWorkerURL = await createBundledWorkerURL();
+  const classWorkerURL = createBundledWorkerURL();
 
   const mtBaseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core-mt@0.12.10/dist/esm';
   
   try {
     statusEl.textContent = 'Loading FFmpeg (Multi-Threaded)...';
     await ffmpegInstance.load({
-      coreURL: await toBlobURL(\`\${mtBaseURL}/ffmpeg-core.js\`, 'text/javascript'),
-      wasmURL: await toBlobURL(\`\${mtBaseURL}/ffmpeg-core.wasm\`, 'application/wasm'),
-      workerURL: await toBlobURL(\`\${mtBaseURL}/ffmpeg-core.worker.js\`, 'text/javascript'),
+      coreURL: await toBlobURL(`${mtBaseURL}/ffmpeg-core.js`, 'text/javascript'),
+      wasmURL: await toBlobURL(`${mtBaseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+      workerURL: await toBlobURL(`${mtBaseURL}/ffmpeg-core.worker.js`, 'text/javascript'),
       classWorkerURL
     });
     
@@ -1052,8 +1054,8 @@ async function loadFFmpeg() {
   try {
     statusEl.textContent = 'Loading FFmpeg (Single-Threaded)...';
     await ffmpegInstance.load({
-      coreURL: await toBlobURL(\`\${stBaseURL}/ffmpeg-core.js\`, 'text/javascript'),
-      wasmURL: await toBlobURL(\`\${stBaseURL}/ffmpeg-core.wasm\`, 'application/wasm'),
+      coreURL: await toBlobURL(`${stBaseURL}/ffmpeg-core.js`, 'text/javascript'),
+      wasmURL: await toBlobURL(`${stBaseURL}/ffmpeg-core.wasm`, 'application/wasm'),
       classWorkerURL
     });
     
@@ -1074,7 +1076,7 @@ function showPage(pageName) {
   const target = document.getElementById('page-' + pageName);
   if (target) target.classList.add('active');
   document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
-  document.querySelectorAll(\`[data-page="\${pageName}"]\`).forEach(l => l.classList.add('active'));
+  document.querySelectorAll(`[data-page="${pageName}"]`).forEach(l => l.classList.add('active'));
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
@@ -1104,7 +1106,7 @@ function handleContact(e) {
   const email = document.getElementById('contactEmail').value;
   const subject = document.getElementById('contactSubject').value;
   const message = document.getElementById('contactMessage').value;
-  const mailto = \`mailto:veknipezeg@gmail.com?subject=\${encodeURIComponent(subject)}&body=\${encodeURIComponent('Name: ' + name + '\nEmail: ' + email + '\n\n' + message)}\`;
+  const mailto = `mailto:veknipezeg@gmail.com?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent('Name: ' + name + '\nEmail: ' + email + '\n\n' + message)}`;
   window.location.href = mailto;
   return false;
 }
@@ -1121,21 +1123,21 @@ function renderList() {
   fileList.innerHTML = '';
   files.forEach((file, i) => {
     const li = document.createElement('li');
-    li.innerHTML = \`
-      <span class="num">\${i + 1}</span>
-      <span class="name" title="\${file.name}">\${file.name}</span>
-      <span class="size">\${formatSize(file.size)}</span>
-      <button data-action="up" data-idx="\${i}" \${i === 0 ? 'disabled' : ''}>Up</button>
-      <button data-action="down" data-idx="\${i}" \${i === files.length - 1 ? 'disabled' : ''}>Down</button>
-      <button data-action="remove" data-idx="\${i}">Remove</button>
-    \`;
+    li.innerHTML = `
+      <span class="num">${i + 1}</span>
+      <span class="name" title="${file.name}">${file.name}</span>
+      <span class="size">${formatSize(file.size)}</span>
+      <button data-action="up" data-idx="${i}" ${i === 0 ? 'disabled' : ''}>Up</button>
+      <button data-action="down" data-idx="${i}" ${i === files.length - 1 ? 'disabled' : ''}>Down</button>
+      <button data-action="remove" data-idx="${i}">Remove</button>
+    `;
     fileList.appendChild(li);
   });
 
   mergeBtn.disabled = files.length < 2;
   counter.textContent = files.length === 0
     ? 'No videos selected'
-    : \`\${files.length} video\${files.length > 1 ? 's' : ''} selected (\${formatSize(files.reduce((a, b) => a + b.size, 0))})\`;
+    : `${files.length} video${files.length > 1 ? 's' : ''} selected (${formatSize(files.reduce((a, b) => a + b.size, 0))})`;
 }
 
 function handleFiles(newFiles) {
@@ -1287,14 +1289,14 @@ async function fastFFmpegTSConcat(filesList, trackInfos, updateProgress) {
   
   let tsFiles = [];
   for (let i = 0; i < filesList.length; i++) {
-    const tsName = \`part_\${i}.ts\`;
-    if (updateProgress) updateProgress(0.40 + ((i) / filesList.length) * 0.30, \`TS remux \${i + 1}/\${filesList.length}\`);
+    const tsName = `part_${i}.ts`;
+    if (updateProgress) updateProgress(0.40 + ((i) / filesList.length) * 0.30, `TS remux ${i + 1}/${filesList.length}`);
     let code = await ffmpegInstance.exec([
       '-fflags', '+genpts',
-      '-i', \`\${mountDir}/\${filesList[i].name}\`,
+      '-i', `${mountDir}/${filesList[i].name}`,
       '-c', 'copy', '-f', 'mpegts', '-y', tsName
     ]);
-    if (code !== 0) throw new Error(\`TS remux failed for \${filesList[i].name}\`);
+    if (code !== 0) throw new Error(`TS remux failed for ${filesList[i].name}`);
     tsFiles.push(tsName);
   }
   
@@ -1319,7 +1321,6 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
   await loadFFmpeg();
   const ffmpegInstance = getFFmpeg();
   
-  // 1. Parallel WebCodecs Pool (Directly processes original files without prior normalization)
   const targetFPS = isAndroid ? 24 : 30;
   const targetBitrate = isAndroid ? 2_500_000 : 5_000_000;
   
@@ -1343,7 +1344,6 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
          const fileUrl = URL.createObjectURL(file);
          activeTasks++;
          
-         // Fetch track info in background for fallback logic only
          const trackInfoPromise = getTrackInfo(file);
          
          const worker = workers[idx % MAX_ACTIVE]; 
@@ -1361,7 +1361,7 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
              URL.revokeObjectURL(fileUrl);
              finishedTasks++;
              activeTasks--;
-             updateProgress(0.2 + (finishedTasks / filesList.length) * 0.6, \`Parallel encoding: \${finishedTasks}/\${filesList.length} done\`);
+             updateProgress(0.2 + (finishedTasks / filesList.length) * 0.6, `Parallel encoding: ${finishedTasks}/${filesList.length} done`);
              if (finishedTasks === filesList.length) resolve();
              else startNext();
            } else if (e.data.type === 'error') {
@@ -1380,7 +1380,7 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
             outHeight: parseInt(outHeight),
             targetFPS,
             targetBitrate,
-            hasAudio: true, // Worker determines actual presence dynamically
+            hasAudio: true, 
             videoTrackInfo: null, 
             audioTrackInfo: null  
          });
@@ -1389,18 +1389,18 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
     
     const processFallback = async (idx, file, trackInfoPromise, fileUrl, timeoutId, errMsg) => {
        if (fileUrl) URL.revokeObjectURL(fileUrl);
-       if (errMsg) console.warn(\`WebCodecs failed for \${idx}, falling back to FFmpeg: \${errMsg}\`);
+       if (errMsg) console.warn(`WebCodecs failed for ${idx}, falling back to FFmpeg: ${errMsg}`);
        try {
          const trackInfo = await trackInfoPromise;
-         const mountDir = \`/fallback_\${idx}\`;
+         const mountDir = `/fallback_${idx}`;
          await ffmpegInstance.createDir(mountDir).catch(()=>{});
          await ffmpegInstance.mount('WORKERFS', { files: [file] }, mountDir);
-         const tsName = \`fallback_\${idx}.ts\`;
-         const videoFilter = \`scale=\${outWidth}:\${outHeight}:force_original_aspect_ratio=decrease,pad=\${outWidth}:\${outHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=\${targetFPS}\`;
+         const tsName = `fallback_${idx}.ts`;
+         const videoFilter = `scale=${outWidth}:${outHeight}:force_original_aspect_ratio=decrease,pad=${outWidth}:${outHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${targetFPS}`;
          
          let args = [
            '-fflags', '+genpts',
-           '-i', \`\${mountDir}/\${file.name}\`,
+           '-i', `${mountDir}/${file.name}`,
            '-vf', videoFilter,
            '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-crf', '28', '-pix_fmt', 'yuv420p'
          ];
@@ -1410,7 +1410,7 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
            args.push('-map', '0:v:0', '-map', '0:a:0');
          } else {
            const duration = trackInfo.duration || 3600;
-           args.push('-f', 'lavfi', '-i', \`anullsrc=r=44100:cl=stereo\`);
+           args.push('-f', 'lavfi', '-i', `anullsrc=r=44100:cl=stereo`);
            args.push('-t', duration.toString());
            args.push('-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k');
            args.push('-map', '0:v:0', '-map', '1:a:0');
@@ -1422,8 +1422,8 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
          if (code !== 0 && trackInfo.hasAudio) {
              const retryArgs = [
                '-fflags', '+genpts',
-               '-i', \`\${mountDir}/\${file.name}\`,
-               '-f', 'lavfi', '-i', \`anullsrc=r=44100:cl=stereo\`,
+               '-i', `${mountDir}/${file.name}`,
+               '-f', 'lavfi', '-i', `anullsrc=r=44100:cl=stereo`,
                '-vf', videoFilter,
                '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-crf', '28', '-pix_fmt', 'yuv420p',
                '-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k',
@@ -1444,7 +1444,7 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
          
          finishedTasks++;
          activeTasks--;
-         updateProgress(0.2 + (finishedTasks / filesList.length) * 0.6, \`Parallel encoding: \${finishedTasks}/\${filesList.length} done\`);
+         updateProgress(0.2 + (finishedTasks / filesList.length) * 0.6, `Parallel encoding: ${finishedTasks}/${filesList.length} done`);
          if (finishedTasks === filesList.length) resolve();
          else startNext();
        } catch(e) {
@@ -1459,14 +1459,13 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
   workers.forEach(w => { try { w.terminate(); } catch(e){} });
   URL.revokeObjectURL(workerUrl);
   
-  // 2. Final Concat
   updateProgress(0.8, 'Concatenating all segments...');
   
   let tsFiles = [];
   for (let i = 0; i < results.length; i++) {
     const part = results[i];
-    const mp4Name = \`part_\${i}.mp4\`;
-    const tsName = \`part_\${i}.ts\`;
+    const mp4Name = `part_${i}.mp4`;
+    const tsName = `part_${i}.ts`;
     
     if (part.type === 'ts') {
       await ffmpegInstance.writeFile(tsName, new Uint8Array(part.buffer));
@@ -1484,7 +1483,7 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
          code = await ffmpegInstance.exec([
            '-fflags', '+genpts',
            '-i', mp4Name,
-           '-f', 'lavfi', '-i', \`anullsrc=r=44100:cl=stereo\`,
+           '-f', 'lavfi', '-i', `anullsrc=r=44100:cl=stereo`,
            '-map', '0:v:0', '-map', '1:a:0',
            '-c:v', 'copy', '-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k',
            '-t', '3600', 
@@ -1492,7 +1491,7 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
          ]);
       }
       
-      if (code !== 0) throw new Error(\`TS remux failed for segment \${i}\`);
+      if (code !== 0) throw new Error(`TS remux failed for segment ${i}`);
       await ffmpegInstance.deleteFile(mp4Name).catch(()=>{});
     }
     tsFiles.push(tsName);
@@ -1576,6 +1575,7 @@ mergeBtn.addEventListener('click', async () => {
     if (allMP4AndCompatible && supportsWebCodecs) {
        try {
          updateProgress(0.1, 'Using instant stream copy (no re-encoding)...');
+         const { Muxer, ArrayBufferTarget } = await import('https://esm.sh/mp4-muxer@5.0.0');
          const target = new ArrayBufferTarget();
          const muxer = new Muxer({
            target,
@@ -1587,7 +1587,7 @@ mergeBtn.addEventListener('click', async () => {
          let nextAudioTs = 0;
          
          for (let fileIdx = 0; fileIdx < files.length; fileIdx++) {
-           updateProgress(0.1 + ((fileIdx + 0.5) / files.length) * 0.8, \`Instant remuxing stream copy \${fileIdx + 1}/\${files.length}\`);
+           updateProgress(0.1 + ((fileIdx + 0.5) / files.length) * 0.8, `Instant remuxing stream copy ${fileIdx + 1}/${files.length}`);
            const buffer = await readFileSlice(files[fileIdx], 0, files[fileIdx].size);
            
            await new Promise((resolve, reject) => {
@@ -1664,7 +1664,7 @@ mergeBtn.addEventListener('click', async () => {
          updateProgress(1.0, 'Instant merge completed without re-encoding!');
        } catch(e) {
          logEl.style.display = 'block';
-         logEl.textContent += \`Instant merge failed: \${e.message}\n\`;
+         logEl.textContent += `Instant merge failed: ${e.message}\n`;
          finalBlob = null;
        }
     }
@@ -1681,7 +1681,7 @@ mergeBtn.addEventListener('click', async () => {
          }
       } catch(e) {
          logEl.style.display = 'block';
-         logEl.textContent += \`Fast TS copy failed: \${e.message}\n\`;
+         logEl.textContent += `Fast TS copy failed: ${e.message}\n`;
       }
     }
     
@@ -1692,10 +1692,10 @@ mergeBtn.addEventListener('click', async () => {
     
     outputBlobUrl = URL.createObjectURL(finalBlob);
     download.href = outputBlobUrl;
-    download.download = \`merged_final_\${Date.now()}.mp4\`;
+    download.download = `merged_final_${Date.now()}.mp4`;
     download.style.display = 'inline-block';
     progress.value = 100;
-    statusEl.textContent = \`Merge complete! Final video size: \${formatSize(finalBlob.size)}\`;
+    statusEl.textContent = `Merge complete! Final video size: ${formatSize(finalBlob.size)}`;
 
   } catch (err) {
     statusEl.textContent = 'Error: ' + err.message;
