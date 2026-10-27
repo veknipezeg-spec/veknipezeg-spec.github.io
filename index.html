@@ -1311,21 +1311,27 @@ async function fastFFmpegTSConcat(filesList, trackInfos, updateProgress) {
   await loadFFmpeg();
   const ffmpegInstance = getFFmpeg();
   
-  const mountDir = '/mnt_ts_concat';
-  try { await ffmpegInstance.createDir(mountDir); } catch(e) {}
-  await ffmpegInstance.mount('WORKERFS', { files: filesList }, mountDir);
-  
   let tsFiles = [];
   for (let i = 0; i < filesList.length; i++) {
+    const file = filesList[i];
+    const safeName = file.name.replace(/[^a-z0-9.]/gi, '_').substring(0, 50);
+    const filePath = `/input_${i}_${safeName}`;
+    
+    if (updateProgress) updateProgress(0.10 + (i / filesList.length) * 0.30, `Loading file ${i + 1}/${filesList.length} into memory...`);
+    await ffmpegInstance.writeFile(filePath, new Uint8Array(await file.arrayBuffer()));
+
     const tsName = `part_${i}.ts`;
     if (updateProgress) updateProgress(0.40 + ((i) / filesList.length) * 0.30, `TS remux ${i + 1}/${filesList.length}`);
     let code = await ffmpegInstance.exec([
       '-fflags', '+genpts',
-      '-i', `${mountDir}/${filesList[i].name}`,
+      '-i', filePath,
       '-c', 'copy', '-f', 'mpegts', '-y', tsName
     ]);
-    if (code !== 0) throw new Error(`TS remux failed for ${filesList[i].name}`);
+    if (code !== 0) throw new Error(`TS remux failed for ${file.name}`);
     tsFiles.push(tsName);
+    
+    // Free memory after remuxing
+    await ffmpegInstance.deleteFile(filePath).catch(()=>{});
   }
   
   if (updateProgress) updateProgress(0.70, 'Concatenating TS streams...');
@@ -1335,9 +1341,7 @@ async function fastFFmpegTSConcat(filesList, trackInfos, updateProgress) {
     '-c', 'copy', '-movflags', '+faststart', '-y', 'final_ts.mp4'
   ]);
   
-  for (const ts of tsFiles) ffmpegInstance.deleteFile(ts).catch(()=>{});
-  await ffmpegInstance.unmount(mountDir).catch(()=>{});
-  await ffmpegInstance.deleteDir(mountDir).catch(()=>{});
+  for (const ts of tsFiles) await ffmpegInstance.deleteFile(ts).catch(()=>{});
   
   if (code !== 0) throw new Error('TS concat protocol failed');
   
@@ -1370,15 +1374,16 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
        if (fileUrl) URL.revokeObjectURL(fileUrl);
        if (errMsg) console.warn(`WebCodecs failed for ${idx}, falling back to FFmpeg: ${errMsg}`);
        try {
-         const mountDir = `/fallback_${idx}`;
-         await ffmpegInstance.createDir(mountDir).catch(()=>{});
-         await ffmpegInstance.mount('WORKERFS', { files: [file] }, mountDir);
+         const safeName = file.name.replace(/[^a-z0-9.]/gi, '_').substring(0, 50);
+         const filePath = `/fallback_input_${idx}_${safeName}`;
+         await ffmpegInstance.writeFile(filePath, new Uint8Array(await file.arrayBuffer()));
+         
          const tsName = `fallback_${idx}.ts`;
          const videoFilter = `scale=${outWidth}:${outHeight}:force_original_aspect_ratio=decrease,pad=${outWidth}:${outHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${targetFPS}`;
          
          let args = [
            '-fflags', '+genpts',
-           '-i', `${mountDir}/${file.name}`,
+           '-i', filePath,
            '-vf', videoFilter,
            '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-crf', '28', '-pix_fmt', 'yuv420p'
          ];
@@ -1400,7 +1405,7 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
          if (code !== 0 && trackInfo.hasAudio) {
              const retryArgs = [
                '-fflags', '+genpts',
-               '-i', `${mountDir}/${file.name}`,
+               '-i', filePath,
                '-f', 'lavfi', '-i', `anullsrc=r=44100:cl=stereo`,
                '-vf', videoFilter,
                '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-crf', '28', '-pix_fmt', 'yuv420p',
@@ -1417,8 +1422,7 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
          const data = await ffmpegInstance.readFile(tsName);
          results[idx] = { type: 'ts', buffer: data.buffer };
          await ffmpegInstance.deleteFile(tsName).catch(()=>{});
-         await ffmpegInstance.unmount(mountDir).catch(()=>{});
-         await ffmpegInstance.deleteDir(mountDir).catch(()=>{});
+         await ffmpegInstance.deleteFile(filePath).catch(()=>{});
          
          finishedTasks++;
          activeTasks--;
