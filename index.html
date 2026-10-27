@@ -488,10 +488,9 @@ self.onmessage = async (e) => {
   const { type, fileUrl, outWidth, outHeight, targetFPS, targetBitrate, id, hasAudio } = e.data;
   
   if (type === 'process') {
-    // Global timeout to ensure the worker never hangs silently
     const jobTimeout = setTimeout(() => {
        self.postMessage({ type: 'error', id, msg: 'WebCodecs job timeout' });
-    }, 120000); // 2 minutes
+    }, 120000);
 
     try {
       if (typeof MP4Box === 'undefined') {
@@ -993,7 +992,6 @@ if (isAndroid) {
 let ffmpeg = null;
 let ffmpegLoaded = false;
 
-// --- NEW: Global variables to fix concurrency and UI progress ---
 let ffmpegLock = Promise.resolve();
 let currentFallbackMsg = '';
 
@@ -1038,7 +1036,6 @@ async function loadFFmpeg() {
     logEl.scrollTop = logEl.scrollHeight;
   });
 
-  // --- FIX: Update status text dynamically during fallback encoding ---
   ffmpegInstance.on('progress', ({ progress: p }) => {
     const percent = Math.min(100, Math.max(0, p * 100));
     progress.value = percent;
@@ -1281,18 +1278,63 @@ async function fastFFmpegTSConcat(filesList, trackInfos, updateProgress) {
   let tsFiles = [];
   for (let i = 0; i < filesList.length; i++) {
     const file = filesList[i];
+    const trackInfo = trackInfos[i];
     const safeName = file.name.replace(/[^a-z0-9.]/gi, '_').substring(0, 50);
-    const filePath = `/input_${i}_${safeName}`;
     
-    if (updateProgress) updateProgress(0.15 + (i / filesList.length) * 0.25, `Loading file ${i + 1}/${filesList.length} into memory...`);
-    await ffmpegInstance.writeFile(filePath, new Uint8Array(await file.arrayBuffer()));
+    let filePath = `/input_${i}_${safeName}`;
+    let isMounted = false;
+    
+    try {
+        const mountPoint = `/mnt_${i}`;
+        const mounted = await ffmpegInstance.mount('WORKERFS', { files: [file] }, mountPoint);
+        if (mounted) {
+            filePath = `${mountPoint}/${file.name}`;
+            isMounted = true;
+        } else {
+            await ffmpegInstance.writeFile(filePath, new Uint8Array(await file.arrayBuffer()));
+        }
+    } catch(e) {
+        await ffmpegInstance.writeFile(filePath, new Uint8Array(await file.arrayBuffer()));
+    }
 
     const tsName = `part_${i}.ts`;
     if (updateProgress) updateProgress(0.40 + ((i) / filesList.length) * 0.30, `TS remux ${i + 1}/${filesList.length}`);
-    let code = await ffmpegInstance.exec(['-fflags', '+genpts', '-i', filePath, '-c', 'copy', '-f', 'mpegts', '-y', tsName]);
+    
+    let args = ['-fflags', '+genpts', '-i', filePath];
+    if (!trackInfo.hasAudio) {
+        args.push('-f', 'lavfi', '-t', '86400', '-i', 'anullsrc=r=44100:cl=stereo');
+    }
+    args.push('-map', '0:v:0');
+    if (trackInfo.hasAudio) {
+        args.push('-map', '0:a:0');
+    } else {
+        args.push('-map', '1:a:0');
+    }
+    args.push('-c:v', 'copy');
+    args.push('-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k');
+    args.push('-shortest', '-f', 'mpegts', '-y', tsName);
+
+    let code = await ffmpegInstance.exec(args);
+    
+    if (code !== 0) {
+        let retryArgs = ['-fflags', '+genpts', '-i', filePath];
+        retryArgs.push('-f', 'lavfi', '-t', '86400', '-i', 'anullsrc=r=44100:cl=stereo');
+        retryArgs.push('-map', '0:v:0');
+        retryArgs.push('-map', '1:a:0');
+        retryArgs.push('-c:v', 'copy');
+        retryArgs.push('-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k');
+        retryArgs.push('-shortest', '-f', 'mpegts', '-y', tsName);
+        code = await ffmpegInstance.exec(retryArgs);
+    }
+    
     if (code !== 0) throw new Error(`TS remux failed for ${file.name}`);
     tsFiles.push(tsName);
-    await ffmpegInstance.deleteFile(filePath).catch(()=>{});
+    
+    if (isMounted) {
+        await ffmpegInstance.unmount(`/mnt_${i}`).catch(()=>{});
+    } else {
+        await ffmpegInstance.deleteFile(filePath).catch(()=>{});
+    }
   }
   
   if (updateProgress) updateProgress(0.70, 'Concatenating TS streams...');
@@ -1331,7 +1373,6 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
        if (fileUrl) URL.revokeObjectURL(fileUrl);
        if (errMsg) console.warn(`WebCodecs failed for ${idx}, falling back to FFmpeg: ${errMsg}`);
        
-       // --- FIX: Mutex lock to prevent multiple FFmpeg instances from corrupting memory ---
        const prevLock = ffmpegLock;
        let releaseLock;
        ffmpegLock = new Promise(res => releaseLock = res);
@@ -1344,49 +1385,55 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
          if (file.size > 1.5 * 1024 * 1024 * 1024) throw new Error(`File "${file.name}" is too large (>1.5GB). Browser memory limit exceeded.`);
 
          const safeName = file.name.replace(/[^a-z0-9.]/gi, '_').substring(0, 50);
-         const filePath = `/fallback_input_${idx}_${safeName}`;
-         await ffmpegInstance.writeFile(filePath, new Uint8Array(await file.arrayBuffer()));
+         let filePath = `/fallback_input_${idx}_${safeName}`;
+         let isMounted = false;
+         
+         try {
+             const mountPoint = `/mnt_${idx}`;
+             const mounted = await ffmpegInstance.mount('WORKERFS', { files: [file] }, mountPoint);
+             if (mounted) {
+                 filePath = `${mountPoint}/${file.name}`;
+                 isMounted = true;
+             } else {
+                 await ffmpegInstance.writeFile(filePath, new Uint8Array(await file.arrayBuffer()));
+             }
+         } catch(e) {
+             await ffmpegInstance.writeFile(filePath, new Uint8Array(await file.arrayBuffer()));
+         }
          
          const tsName = `fallback_${idx}.ts`;
          const videoFilter = `scale=${outWidth}:${outHeight}:force_original_aspect_ratio=decrease,pad=${outWidth}:${outHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${targetFPS}`;
          
-         // --- FIX: Corrected FFmpeg argument order ---
-         // All inputs (-i) MUST come BEFORE output options and mappings.
          let args = ['-fflags', '+genpts', '-i', filePath];
-         
          if (!trackInfo.hasAudio) {
-           args.push('-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo');
+           args.push('-f', 'lavfi', '-t', '86400', '-i', 'anullsrc=r=44100:cl=stereo');
          }
-         
          args.push('-map', '0:v:0');
          if (trackInfo.hasAudio) {
            args.push('-map', '0:a:0');
          } else {
            args.push('-map', '1:a:0');
          }
-         
          args.push('-vf', videoFilter);
          args.push('-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-crf', '28', '-pix_fmt', 'yuv420p');
-         
          if (trackInfo.hasAudio) {
            args.push('-af', 'aresample=44100,aformat=channel_layouts=stereo');
          }
          args.push('-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k');
-         
          args.push('-shortest', '-f', 'mpegts', '-y', tsName);
          
          let code = await ffmpegInstance.exec(args);
          
          if (code !== 0) {
-             const retryArgs = [
-               '-fflags', '+genpts', '-i', filePath,
-               '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
-               '-map', '0:v:0', '-map', '1:a:0',
-               '-vf', videoFilter,
-               '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-crf', '28', '-pix_fmt', 'yuv420p',
-               '-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k',
-               '-shortest', '-f', 'mpegts', '-y', tsName
-             ];
+             let retryArgs = ['-fflags', '+genpts', '-i', filePath];
+             retryArgs.push('-f', 'lavfi', '-t', '86400', '-i', 'anullsrc=r=44100:cl=stereo');
+             retryArgs.push('-map', '0:v:0');
+             retryArgs.push('-map', '1:a:0');
+             retryArgs.push('-vf', videoFilter);
+             retryArgs.push('-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-crf', '32', '-pix_fmt', 'yuv420p');
+             retryArgs.push('-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k');
+             retryArgs.push('-shortest', '-f', 'mpegts', '-y', tsName);
+             
              code = await ffmpegInstance.exec(retryArgs);
          }
          
@@ -1395,7 +1442,12 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
          const data = await ffmpegInstance.readFile(tsName);
          results[idx] = { type: 'ts', buffer: data.buffer };
          await ffmpegInstance.deleteFile(tsName).catch(()=>{});
-         await ffmpegInstance.deleteFile(filePath).catch(()=>{});
+         
+         if (isMounted) {
+             await ffmpegInstance.unmount(`/mnt_${idx}`).catch(()=>{});
+         } else {
+             await ffmpegInstance.deleteFile(filePath).catch(()=>{});
+         }
          
          finishedTasks++;
          activeTasks--;
@@ -1476,10 +1528,9 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
       if (part.hasAudio) {
          code = await ffmpegInstance.exec(['-fflags', '+genpts', '-i', mp4Name, '-c', 'copy', '-f', 'mpegts', '-y', tsName]);
       } else {
-         // --- FIX: Removed "-t 3600" here as well ---
          code = await ffmpegInstance.exec([
            '-fflags', '+genpts', '-i', mp4Name,
-           '-f', 'lavfi', '-i', `anullsrc=r=44100:cl=stereo`,
+           '-f', 'lavfi', '-t', '86400', '-i', `anullsrc=r=44100:cl=stereo`,
            '-map', '0:v:0', '-map', '1:a:0',
            '-c:v', 'copy', '-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k',
            '-shortest', '-f', 'mpegts', '-y', tsName
