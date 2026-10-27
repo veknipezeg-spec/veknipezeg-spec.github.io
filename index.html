@@ -1223,142 +1223,42 @@ async function remuxNonMP4Files(filesList) {
   return finalList;
 }
 
-async function fastFFmpegNativeConcat(filesList) {
+async function fastFFmpegTSConcat(filesList, trackInfos) {
   await loadFFmpeg();
   const ffmpegInstance = getFFmpeg();
-  statusEl.textContent = 'Attempting native FFmpeg stream copy concat...';
+  statusEl.textContent = 'Fast remux to TS and stream copy concat...';
   progress.value = 15;
   
-  // Track timestamp errors via FFmpeg logs
-  let hasTimestampError = false;
-  const logListener = ({ message }) => {
-    if (message.includes('invalid dropping') || message.includes('Non-monotonous DTS') || message.includes('non monotonous')) {
-      hasTimestampError = true;
-    }
-  };
-  
-  if (typeof ffmpegInstance.on === 'function') ffmpegInstance.on('log', logListener);
-
-  const mountDir = '/mnt_native_concat';
+  const mountDir = '/mnt_ts_concat';
   try { await ffmpegInstance.createDir(mountDir); } catch(e) {}
   await ffmpegInstance.mount('WORKERFS', { files: filesList }, mountDir);
   
-  let concatList = '';
-  let isAllWebM = true;
+  let tsFiles = [];
   for (let i = 0; i < filesList.length; i++) {
-    concatList += `file '${mountDir}/${filesList[i].name}'\n`;
-    if (!filesList[i].name.match(/\.webm$|\.mkv$/i)) isAllWebM = false;
+    const tsName = `part_${i}.ts`;
+    let code = await ffmpegInstance.exec([
+      '-fflags', '+genpts',
+      '-i', `${mountDir}/${filesList[i].name}`,
+      '-c', 'copy', '-f', 'mpegts', '-y', tsName
+    ]);
+    if (code !== 0) throw new Error(`TS remux failed for ${filesList[i].name}`);
+    tsFiles.push(tsName);
+    progress.value = 15 + ((i + 1) / filesList.length) * 30;
   }
   
-  await ffmpegInstance.writeFile('native_concat.txt', concatList);
+  const concatStr = 'concat:' + tsFiles.join('|');
+  const code = await ffmpegInstance.exec([
+    '-i', concatStr,
+    '-c', 'copy', '-movflags', '+faststart', '-y', 'final_ts.mp4'
+  ]);
   
-  const ext = isAllWebM ? 'webm' : 'mp4';
-  const outName = `fast_native.${ext}`;
+  for (const ts of tsFiles) ffmpegInstance.deleteFile(ts).catch(()=>{});
+  await ffmpegInstance.unmount(mountDir).catch(()=>{});
+  await ffmpegInstance.deleteDir(mountDir).catch(()=>{});
   
-  // Added -fflags +genpts and -avoid_negative_ts make_zero to try and salvage stream copy
-  const args = [
-    '-fflags', '+genpts',
-    '-avoid_negative_ts', 'make_zero',
-    '-f', 'concat', '-safe', '0', '-i', 'native_concat.txt', 
-    '-c', 'copy'
-  ];
-  if (!isAllWebM) args.push('-movflags', '+faststart');
-  args.push('-y', outName);
+  if (code !== 0) throw new Error('TS concat protocol failed');
   
-  const code = await ffmpegInstance.exec(args);
-  
-  // Clean up listener if possible
-  if (typeof ffmpegInstance.off === 'function') ffmpegInstance.off('log', logListener);
-  
-  try { await ffmpegInstance.deleteFile('native_concat.txt'); } catch(e) {}
-  await ffmpegInstance.unmount(mountDir).catch(() => {});
-  await ffmpegInstance.deleteDir(mountDir).catch(() => {});
-  
-  if (code === 0) {
-    // If we detected "invalid dropping", throw an error to trigger the re-encoding fallback!
-    if (hasTimestampError) {
-      throw new Error('Native concat produced timestamp errors (invalid dropping). Falling back to re-encode to prevent video glitches.');
-    }
-    
-    const data = await ffmpegInstance.readFile(outName);
-    if (data && data.length > 10000) {
-      try { await ffmpegInstance.deleteFile(outName); } catch(e) {}
-      return new Blob([data.buffer], { type: `video/${ext}` });
-    }
-  }
-  throw new Error('FFmpeg native concat failed');
-}
-
-async function singlePassFFmpegConcat(filesList, trackInfos, outWidth, outHeight) {
-  await loadFFmpeg();
-  const ffmpegInstance = getFFmpeg();
-  statusEl.textContent = 'Running single-pass FFmpeg filter graph...';
-  progress.value = 30;
-  
-  const mountDir = '/mnt_single_pass';
-  try { await ffmpegInstance.createDir(mountDir); } catch(e) {}
-  await ffmpegInstance.mount('WORKERFS', { files: filesList }, mountDir);
-  
-  const fps = isAndroid ? 24 : 30;
-  const inputArgs = [];
-  let filterComplex = '';
-  let videoStreams = '';
-  let audioStreams = '';
-  let hasAnyAudio = false;
-  
-  for (let i = 0; i < filesList.length; i++) {
-    inputArgs.push('-i', `${mountDir}/${filesList[i].name}`);
-    
-    filterComplex += `[${i}:v:0]scale=${outWidth}:${outHeight}:force_original_aspect_ratio=decrease,pad=${outWidth}:${outHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${fps}[v${i}];`;
-    videoStreams += `[v${i}]`;
-    
-    const trackInfo = trackInfos[i];
-    if (trackInfo.hasAudio) {
-      filterComplex += `[${i}:a:0]aresample=44100,aformat=channel_layouts=stereo[a${i}];`;
-      audioStreams += `[a${i}]`;
-      hasAnyAudio = true;
-    } else {
-      const duration = trackInfo.duration || 10; 
-      filterComplex += `anullsrc=r=44100:cl=stereo,atrim=0:${duration},asetpts=PTS-STARTPTS[a${i}];`;
-      audioStreams += `[a${i}]`;
-      hasAnyAudio = true;
-    }
-  }
-  
-  filterComplex = filterComplex.slice(0, -1);
-  filterComplex += `;${videoStreams}concat=n=${filesList.length}:v=1:a=0[outv]`;
-  
-  if (hasAnyAudio) {
-    filterComplex += `;${audioStreams}concat=n=${filesList.length}:v=0:a=1[outa]`;
-  }
-  
-  const outputArgs = [
-    '-filter_complex', filterComplex,
-    '-map', '[outv]'
-  ];
-  
-  if (hasAnyAudio) {
-    outputArgs.push('-map', '[outa]');
-    outputArgs.push('-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k');
-  }
-  
-  outputArgs.push(
-    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', '-tune', 'fastdecode', '-pix_fmt', 'yuv420p',
-    '-threads', '0',
-    '-movflags', '+faststart',
-    '-y', 'final_single_pass.mp4'
-  );
-  
-  const code = await ffmpegInstance.exec([...inputArgs, ...outputArgs]);
-  
-  await ffmpegInstance.unmount(mountDir).catch(() => {});
-  await ffmpegInstance.deleteDir(mountDir).catch(() => {});
-  
-  if (code !== 0) throw new Error('Single-pass FFmpeg concat failed');
-  
-  const data = await ffmpegInstance.readFile('final_single_pass.mp4');
-  try { await ffmpegInstance.deleteFile('final_single_pass.mp4'); } catch(e) {}
-  
+  const data = await ffmpegInstance.readFile('final_ts.mp4');
   return new Blob([data.buffer], { type: 'video/mp4' });
 }
 
@@ -1437,28 +1337,100 @@ async function processWithWorkerPool(filesList, trackInfos, outWidth, outHeight)
   });
 }
 
-async function finalConcat(results) {
+async function finalConcatTS(results) {
   await loadFFmpeg();
   const ffmpegInstance = getFFmpeg();
-  statusEl.textContent = 'Finalizing single pass concatenation...';
+  statusEl.textContent = 'Finalizing hardware encode with TS concat...';
   progress.value = 90;
   
-  let concatList = '';
+  let tsFiles = [];
   for (let i = 0; i < results.length; i++) {
-    const fname = `part_${i}.mp4`;
-    await ffmpegInstance.writeFile(fname, new Uint8Array(results[i]));
-    concatList += `file '${fname}'\n`;
+    const mp4Name = `part_${i}.mp4`;
+    const tsName = `part_${i}.ts`;
+    await ffmpegInstance.writeFile(mp4Name, new Uint8Array(results[i]));
+    let code = await ffmpegInstance.exec([
+      '-fflags', '+genpts',
+      '-i', mp4Name,
+      '-c', 'copy', '-f', 'mpegts', '-y', tsName
+    ]);
+    if (code !== 0) throw new Error(`TS remux failed for worker output ${i}`);
+    tsFiles.push(tsName);
+    ffmpegInstance.deleteFile(mp4Name).catch(()=>{});
   }
   
-  await ffmpegInstance.writeFile('concat.txt', concatList);
+  const concatStr = 'concat:' + tsFiles.join('|');
   const code = await ffmpegInstance.exec([
-    '-f', 'concat', '-safe', '0', '-i', 'concat.txt',
-    '-c', 'copy', '-movflags', '+faststart', 'final.mp4'
+    '-i', concatStr,
+    '-c', 'copy', '-movflags', '+faststart', '-y', 'final.mp4'
   ]);
   
-  if (code !== 0) throw new Error('Final concatenation failed');
+  for (const ts of tsFiles) ffmpegInstance.deleteFile(ts).catch(()=>{});
+  
+  if (code !== 0) throw new Error('Final TS concat failed');
   
   const data = await ffmpegInstance.readFile('final.mp4');
+  return new Blob([data.buffer], { type: 'video/mp4' });
+}
+
+async function fastSequentialReencode(filesList, trackInfos, outWidth, outHeight) {
+  await loadFFmpeg();
+  const ffmpegInstance = getFFmpeg();
+  statusEl.textContent = 'Sequential fast re-encoding to TS...';
+  progress.value = 30;
+  
+  const mountDir = '/mnt_seq_enc';
+  try { await ffmpegInstance.createDir(mountDir); } catch(e) {}
+  await ffmpegInstance.mount('WORKERFS', { files: filesList }, mountDir);
+  
+  const fps = isAndroid ? 24 : 30;
+  let tsFiles = [];
+  
+  for (let i = 0; i < filesList.length; i++) {
+    const tsName = `enc_${i}.ts`;
+    const trackInfo = trackInfos[i];
+    
+    const videoFilter = `scale=${outWidth}:${outHeight}:force_original_aspect_ratio=decrease,pad=${outWidth}:${outHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${fps}`;
+    
+    let args = [
+      '-fflags', '+genpts',
+      '-i', `${mountDir}/${filesList[i].name}`,
+      '-vf', videoFilter,
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-crf', '28', '-pix_fmt', 'yuv420p'
+    ];
+    
+    if (trackInfo.hasAudio) {
+      args.push('-af', 'aresample=44100,aformat=channel_layouts=stereo');
+      args.push('-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k');
+      args.push('-map', '0:v:0', '-map', '0:a:0');
+    } else {
+      const duration = trackInfo.duration || 10;
+      args.push('-f', 'lavfi', '-i', `anullsrc=r=44100:cl=stereo`);
+      args.push('-t', duration.toString());
+      args.push('-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k');
+      args.push('-map', '0:v:0', '-map', '1:a:0');
+    }
+    
+    args.push('-f', 'mpegts', '-y', tsName);
+    
+    let code = await ffmpegInstance.exec(args);
+    if (code !== 0) throw new Error(`Sequential encode failed for file ${i}`);
+    tsFiles.push(tsName);
+    progress.value = 30 + ((i + 1) / filesList.length) * 60;
+  }
+  
+  const concatStr = 'concat:' + tsFiles.join('|');
+  const code = await ffmpegInstance.exec([
+    '-i', concatStr,
+    '-c', 'copy', '-movflags', '+faststart', '-y', 'final_seq.mp4'
+  ]);
+  
+  for (const ts of tsFiles) ffmpegInstance.deleteFile(ts).catch(()=>{});
+  await ffmpegInstance.unmount(mountDir).catch(()=>{});
+  await ffmpegInstance.deleteDir(mountDir).catch(()=>{});
+  
+  if (code !== 0) throw new Error('Final TS concat failed');
+  
+  const data = await ffmpegInstance.readFile('final_seq.mp4');
   return new Blob([data.buffer], { type: 'video/mp4' });
 }
 
@@ -1496,33 +1468,27 @@ mergeBtn.addEventListener('click', async () => {
     const hasDefinitivelyNoVideo = trackInfos.some(t => t.isMP4 && t.parsed === true && !t.hasVideo);
     if (hasDefinitivelyNoVideo) throw new Error('One or more files have no video track');
     
-    try {
-      const blob = await fastFFmpegNativeConcat(currentFiles);
-      if (blob && blob.size > 1000) {
-        outputBlobUrl = URL.createObjectURL(blob);
-        download.href = outputBlobUrl;
-        download.download = `merged_native_${Date.now()}.${blob.type.includes('webm') ? 'webm' : 'mp4'}`;
-        download.style.display = 'inline-block';
-        progress.value = 100;
-        statusEl.textContent = `Native stream copy success! (${formatSize(blob.size)})`;
-        return;
-      }
-    } catch (ncErr) {
-      logEl.style.display = 'block';
-      logEl.textContent += 'Native concat failed: ' + ncErr.message + '\n';
-    }
+    const firstVt = trackInfos[0].videoTrack;
+    const firstAt = trackInfos[0].audioTrack;
+    const firstHasAudio = trackInfos[0].hasAudio;
     
     const allMP4AndCompatible = currentFiles.every((f, idx) => {
       const t = trackInfos[idx];
       if (!t.isMP4 || !t.parsed || !t.hasVideo || !t.videoTrack) return false;
+      if (!firstVt || !firstVt.codec) return false;
       
-      // Ensure video is H.264 (AVC) and audio is AAC (or absent) for safe stream copy
       const isAvc = t.videoTrack.codec && t.videoTrack.codec.startsWith('avc');
       if (!isAvc) return false;
+      if (t.videoTrack.width !== firstVt.width || t.videoTrack.height !== firstVt.height) return false;
       
-      if (t.hasAudio && t.audioTrack) {
+      if (firstHasAudio) {
+        if (!t.hasAudio || !t.audioTrack) return false;
         const isAac = t.audioTrack.codec && t.audioTrack.codec.startsWith('mp4a');
         if (!isAac) return false;
+        if (t.audioTrack.sampleRate !== firstAt.sampleRate) return false;
+        if (t.audioTrack.channels !== firstAt.channels) return false;
+      } else {
+        if (t.hasAudio) return false;
       }
       
       return true;
@@ -1533,8 +1499,6 @@ mergeBtn.addEventListener('click', async () => {
         statusEl.textContent = 'Using instant stream copy (no re-encoding)...';
         progress.value = 20;
         const target = new ArrayBufferTarget();
-        const firstVt = trackInfos[0].videoTrack;
-        const firstAt = trackInfos[0].audioTrack;
         
         const muxer = new Muxer({
           target,
@@ -1543,7 +1507,9 @@ mergeBtn.addEventListener('click', async () => {
           fastStart: 'in-memory'
         });
         
-        let baseTimestamp = 0;
+        let nextVideoTs = 0;
+        let nextAudioTs = 0;
+        
         for (let fileIdx = 0; fileIdx < currentFiles.length; fileIdx++) {
           statusEl.textContent = `Remuxing stream copy ${fileIdx + 1}/${currentFiles.length}`;
           progress.value = 20 + ((fileIdx + 0.5) / currentFiles.length) * 70;
@@ -1552,8 +1518,12 @@ mergeBtn.addEventListener('click', async () => {
           
           await new Promise((resolve, reject) => {
             const mp4boxFile = MP4Box.createFile();
-            let maxVideoTs = 0;
-            let maxAudioTs = 0;
+            let videoStartTs = null;
+            let audioStartTs = null;
+            let maxVideoDuration = 0;
+            let maxAudioDuration = 0;
+            let lastVideoTs = nextVideoTs - 1;
+            let lastAudioTs = nextAudioTs - 1;
             
             mp4boxFile.onReady = (info) => {
               const videoTrack = info.tracks.find(t => t.type === 'video');
@@ -1565,9 +1535,14 @@ mergeBtn.addEventListener('click', async () => {
               mp4boxFile.onSamples = (id, user, samples) => {
                 if (videoTrack && id === videoTrack.id) {
                   for (const sample of samples) {
-                    const ts = baseTimestamp + Math.round(sample.cts * 1000000 / sample.timescale);
-                    const dur = Math.round(sample.duration * 1000000 / sample.timescale);
-                    maxVideoTs = Math.max(maxVideoTs, ts + dur);
+                    let rawTs = Math.round(sample.cts * 1000000 / sample.timescale);
+                    let dur = Math.round(sample.duration * 1000000 / sample.timescale);
+                    if (videoStartTs === null) videoStartTs = rawTs;
+                    let ts = nextVideoTs + (rawTs - videoStartTs);
+                    if (ts <= lastVideoTs) ts = lastVideoTs + 1000;
+                    lastVideoTs = ts;
+                    let endTs = ts + dur;
+                    if (endTs - nextVideoTs > maxVideoDuration) maxVideoDuration = endTs - nextVideoTs;
                     try {
                       muxer.addVideoChunk(new EncodedVideoChunk({ 
                         type: sample.is_sync ? 'key' : 'delta', 
@@ -1579,9 +1554,14 @@ mergeBtn.addEventListener('click', async () => {
                   }
                 } else if (audioTrack && id === audioTrack.id) {
                   for (const sample of samples) {
-                    const ts = baseTimestamp + Math.round(sample.cts * 1000000 / sample.timescale);
-                    const dur = Math.round(sample.duration * 1000000 / sample.timescale);
-                    maxAudioTs = Math.max(maxAudioTs, ts + dur);
+                    let rawTs = Math.round(sample.cts * 1000000 / sample.timescale);
+                    let dur = Math.round(sample.duration * 1000000 / sample.timescale);
+                    if (audioStartTs === null) audioStartTs = rawTs;
+                    let ts = nextAudioTs + (rawTs - audioStartTs);
+                    if (ts <= lastAudioTs) ts = lastAudioTs + 1000;
+                    lastAudioTs = ts;
+                    let endTs = ts + dur;
+                    if (endTs - nextAudioTs > maxAudioDuration) maxAudioDuration = endTs - nextAudioTs;
                     try {
                       muxer.addAudioChunk(new EncodedAudioChunk({ 
                         type: sample.is_sync ? 'key' : 'delta', 
@@ -1603,9 +1583,9 @@ mergeBtn.addEventListener('click', async () => {
             mp4boxFile.appendBuffer(buffer);
             mp4boxFile.flush();
             
-            // Wait for synchronous onSamples calls to finish
             setTimeout(() => {
-              baseTimestamp = Math.max(baseTimestamp, maxVideoTs, maxAudioTs);
+              nextVideoTs += maxVideoDuration;
+              nextAudioTs += maxAudioDuration;
               resolve();
             }, 50);
           });
@@ -1625,12 +1605,30 @@ mergeBtn.addEventListener('click', async () => {
       }
     }
     
-    if (allMP4AndCompatible && supportsWebCodecs) {
+    if (allMP4AndCompatible) {
+      try {
+        const blob = await fastFFmpegTSConcat(currentFiles, trackInfos);
+        if (blob && blob.size > 1000) {
+          outputBlobUrl = URL.createObjectURL(blob);
+          download.href = outputBlobUrl;
+          download.download = `merged_native_ts_${Date.now()}.mp4`;
+          download.style.display = 'inline-block';
+          progress.value = 100;
+          statusEl.textContent = `Fast TS stream copy success! (${formatSize(blob.size)})`;
+          return;
+        }
+      } catch (ncErr) {
+        logEl.style.display = 'block';
+        logEl.textContent += 'TS concat failed: ' + ncErr.message + '\n';
+      }
+    }
+    
+    if (supportsWebCodecs) {
       try {
         statusEl.textContent = 'Spinning up parallel WebCodecs hardware workers...';
         progress.value = 25;
         const results = await processWithWorkerPool(currentFiles, trackInfos, outWidth, outHeight);
-        const blob = await finalConcat(results);
+        const blob = await finalConcatTS(results);
         outputBlobUrl = URL.createObjectURL(blob);
         download.href = outputBlobUrl;
         download.download = `merged_hardware_${Date.now()}.mp4`;
@@ -1645,98 +1643,22 @@ mergeBtn.addEventListener('click', async () => {
     }
     
     try {
-      statusEl.textContent = 'Attempting single-pass FFmpeg filter graph...';
-      progress.value = 30;
-      const blob = await singlePassFFmpegConcat(currentFiles, trackInfos, outWidth, outHeight);
+      const blob = await fastSequentialReencode(currentFiles, trackInfos, outWidth, outHeight);
       if (blob && blob.size > 1000) {
         outputBlobUrl = URL.createObjectURL(blob);
         download.href = outputBlobUrl;
-        download.download = `merged_singlepass_${Date.now()}.mp4`;
+        download.download = `merged_seq_${Date.now()}.mp4`;
         download.style.display = 'inline-block';
         progress.value = 100;
-        statusEl.textContent = `Single-pass FFmpeg success! (${formatSize(blob.size)})`;
+        statusEl.textContent = `Sequential fast re-encode success! (${formatSize(blob.size)})`;
         return;
       }
     } catch (spErr) {
       logEl.style.display = 'block';
-      logEl.textContent += 'Single-pass failed: ' + spErr.message + '\n';
+      logEl.textContent += 'Sequential encode failed: ' + spErr.message + '\n';
     }
     
-    statusEl.textContent = 'Falling back to FFmpeg software encoding...';
-    progress.value = 30;
-    const ffmpegInstance = getFFmpeg();
-    
-    const mountDir = '/mnt_fallback';
-    try { await ffmpegInstance.createDir(mountDir); } catch(e) {}
-    await ffmpegInstance.mount('WORKERFS', { files: currentFiles }, mountDir);
-    
-    const fps = isAndroid ? 24 : 30;
-    const inputArgs = [];
-    let filterComplex = '';
-    let videoStreams = '';
-    let audioStreams = '';
-    let hasAnyAudio = false;
-    
-    for (let i = 0; i < currentFiles.length; i++) {
-      inputArgs.push('-i', `${mountDir}/${currentFiles[i].name}`);
-      
-      filterComplex += `[${i}:v:0]scale=${outWidth}:${outHeight}:force_original_aspect_ratio=decrease,pad=${outWidth}:${outHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${fps}[v${i}];`;
-      videoStreams += `[v${i}]`;
-      
-      const trackInfo = trackInfos[i];
-      if (trackInfo.hasAudio) {
-        filterComplex += `[${i}:a:0]aresample=44100,aformat=channel_layouts=stereo[a${i}];`;
-        audioStreams += `[a${i}]`;
-        hasAnyAudio = true;
-      } else {
-        const duration = trackInfo.duration || 10; 
-        filterComplex += `anullsrc=r=44100:cl=stereo,atrim=0:${duration},asetpts=PTS-STARTPTS[a${i}];`;
-        audioStreams += `[a${i}]`;
-        hasAnyAudio = true;
-      }
-    }
-    
-    filterComplex = filterComplex.slice(0, -1);
-    filterComplex += `;${videoStreams}concat=n=${currentFiles.length}:v=1:a=0[outv]`;
-    
-    if (hasAnyAudio) {
-      filterComplex += `;${audioStreams}concat=n=${currentFiles.length}:v=0:a=1[outa]`;
-    }
-    
-    const outputArgs = [
-      '-filter_complex', filterComplex,
-      '-map', '[outv]'
-    ];
-    
-    if (hasAnyAudio) {
-      outputArgs.push('-map', '[outa]');
-      outputArgs.push('-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k');
-    }
-    
-    outputArgs.push(
-      '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', '-tune', 'fastdecode', '-pix_fmt', 'yuv420p',
-      '-threads', '0',
-      '-movflags', '+faststart',
-      '-y', 'final_fallback.mp4'
-    );
-    
-    const code = await ffmpegInstance.exec([...inputArgs, ...outputArgs]);
-    
-    await ffmpegInstance.unmount(mountDir).catch(() => {});
-    await ffmpegInstance.deleteDir(mountDir).catch(() => {});
-    
-    if (code !== 0) throw new Error('FFmpeg fallback encoding failed');
-    
-    const data = await ffmpegInstance.readFile('final_fallback.mp4');
-    try { await ffmpegInstance.deleteFile('final_fallback.mp4'); } catch(e) {}
-    
-    const blob = new Blob([data.buffer], { type: 'video/mp4' });
-    outputBlobUrl = URL.createObjectURL(blob);
-    download.href = outputBlobUrl;
-    download.download = `merged_${Date.now()}.mp4`;
-    download.style.display = 'inline-block';
-    progress.value = 100;
-    statusEl.textContent = `FFmpeg encode success! (${formatSize(blob.size)})`;
+    throw new Error('All merging methods failed. Check the log for details.');
 
   } catch (err) {
     statusEl.textContent = 'Error: ' + err.message;
