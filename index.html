@@ -499,7 +499,7 @@ if ('serviceWorker' in navigator) {
 
 const webCodecsWorkerCode = `
 self.onmessage = async (e) => {
-  const { type, fileUrl, outWidth, outHeight, targetFPS, targetBitrate, id, hasAudio, videoTrackInfo, audioTrackInfo } = e.data;
+  const { type, fileUrl, outWidth, outHeight, targetFPS, targetBitrate, id } = e.data;
   
   if (type === 'process') {
     try {
@@ -513,174 +513,193 @@ self.onmessage = async (e) => {
       
       const { Muxer, ArrayBufferTarget } = await import('https://esm.sh/mp4-muxer@5.0.0');
       
-      const target = new ArrayBufferTarget();
-      const muxer = new Muxer({
-        target,
-        video: { codec: 'avc', width: outWidth, height: outHeight },
-        audio: hasAudio ? { codec: 'aac', numberOfChannels: 2, sampleRate: 44100 } : undefined,
-        fastStart: 'in-memory'
-      });
-      
-      let encoderError = null;
-      let decoderError = null;
-
-      const videoEncoder = new VideoEncoder({
-        output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
-        error: (e) => { encoderError = e; }
-      });
-      
-      let hwFailed = false;
-      try {
-        videoEncoder.configure({
-          codec: 'avc1.640028',
-          width: outWidth, height: outHeight,
-          bitrate: targetBitrate, framerate: targetFPS,
-          hardwareAcceleration: 'prefer-hardware', latencyMode: 'realtime'
-        });
-        if (videoEncoder.state === 'error') throw new Error('Encoder entered error state');
-      } catch(e) {
-        hwFailed = true;
-        try {
-          videoEncoder.configure({
-            codec: 'avc1.640028',
-            width: outWidth, height: outHeight,
-            bitrate: targetBitrate, framerate: targetFPS,
-            hardwareAcceleration: 'prefer-software'
-          });
-        } catch (e2) {
-          throw new Error('Encoder configuration failed for both hardware and software: ' + e2.message);
-        }
-      }
-      
-      let canvas = new OffscreenCanvas(outWidth, outHeight);
-      let gl = canvas.getContext('webgl2', { antialias: false, depth: false, stencil: false, preserveDrawingBuffer: false });
-      let useWebGL = false;
+      let muxer = null;
+      let target = null;
+      let videoEncoder = null;
+      let videoDecoder = null;
+      let audioEncoder = null;
+      let audioDecoder = null;
+      let canvas = null;
+      let gl = null;
       let ctx = null;
       let texture = null;
-      
-      if (gl) {
-        try {
-          const vsSource = \`#version 300 es
-          in vec2 a_pos; in vec2 a_tex; out vec2 v_tex;
-          void main() { gl_Position = vec4(a_pos, 0, 1); v_tex = a_tex; }\`;
-          const fsSource = \`#version 300 es
-          precision mediump float; in vec2 v_tex; out vec4 o; uniform sampler2D u;
-          void main() { o = texture(u, v_tex); }\`;
-          
-          const vs = gl.createShader(gl.VERTEX_SHADER); gl.shaderSource(vs, vsSource); gl.compileShader(vs);
-          const fs = gl.createShader(gl.FRAGMENT_SHADER); gl.shaderSource(fs, fsSource); gl.compileShader(fs);
-          const prog = gl.createProgram(); gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog); gl.useProgram(prog);
-          
-          const pb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, pb); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
-          const pl = gl.getAttribLocation(prog, 'a_pos'); gl.enableVertexAttribArray(pl); gl.vertexAttribPointer(pl, 2, gl.FLOAT, false, 0, 0);
-          
-          const tb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, tb); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0,1, 1,1, 0,0, 1,0]), gl.STATIC_DRAW);
-          const tl = gl.getAttribLocation(prog, 'a_tex'); gl.enableVertexAttribArray(tl); gl.vertexAttribPointer(tl, 2, gl.FLOAT, false, 0, 0);
-          
-          texture = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, texture);
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-          
-          gl.uniform1i(gl.getUniformLocation(prog, 'u'), 0);
-          gl.viewport(0, 0, outWidth, outHeight);
-          useWebGL = true;
-        } catch(e) { gl = null; }
-      }
-      if (!useWebGL) ctx = canvas.getContext('2d');
-      
-      const videoDecoder = new VideoDecoder({
-        output: (frame) => {
-          if (encoderError) { frame.close(); return; }
-          let handledAsync = false;
-          try {
-            if (frame.codedWidth === outWidth && frame.codedHeight === outHeight) {
-              videoEncoder.encode(frame, { keyFrame: videoEncoder.encodeQueueSize < 2 });
-            } else if (useWebGL) {
-              gl.bindTexture(gl.TEXTURE_2D, texture);
-              gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame);
-              gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-              const newFrame = new VideoFrame(canvas, { timestamp: frame.timestamp });
-              videoEncoder.encode(newFrame, { keyFrame: videoEncoder.encodeQueueSize < 2 });
-              newFrame.close();
-            } else {
-              handledAsync = true;
-              const timestamp = frame.timestamp;
-              createImageBitmap(frame, { resizeWidth: outWidth, resizeHeight: outHeight }).then(bitmap => {
-                if (encoderError) { frame.close(); return; }
-                const newFrame = new VideoFrame(bitmap, { timestamp });
-                videoEncoder.encode(newFrame, { keyFrame: videoEncoder.encodeQueueSize < 2 });
-                bitmap.close(); newFrame.close(); frame.close();
-              }).catch(() => {
-                if (encoderError) { frame.close(); return; }
-                ctx.drawImage(frame, 0, 0, outWidth, outHeight);
-                const newFrame = new VideoFrame(canvas, { timestamp });
-                videoEncoder.encode(newFrame, { keyFrame: videoEncoder.encodeQueueSize < 2 });
-                newFrame.close(); frame.close();
-              });
-            }
-          } catch(e) {
-             encoderError = e;
-          } finally {
-             if (!handledAsync) frame.close();
-          }
-        },
-        error: (e) => { decoderError = e; }
-      });
-      
-      try {
-        videoDecoder.configure({
-          codec: videoTrackInfo.codec,
-          codedWidth: videoTrackInfo.width,
-          codedHeight: videoTrackInfo.height,
-          description: videoTrackInfo.description || undefined,
-          hardwareAcceleration: 'prefer-hardware'
-        });
-        if (videoDecoder.state === 'error') throw new Error('Decoder entered error state');
-      } catch(e) {
-         try {
-           videoDecoder.configure({
-            codec: videoTrackInfo.codec,
-            codedWidth: videoTrackInfo.width,
-            codedHeight: videoTrackInfo.height,
-            description: videoTrackInfo.description || undefined,
-            hardwareAcceleration: 'prefer-software'
-           });
-         } catch (e2) {
-            throw new Error('Decoder configuration failed for both hardware and software: ' + e2.message);
-         }
-      }
-      
-      let audioDecoder = null;
-      let audioEncoder = null;
-      
-      if (hasAudio && audioTrackInfo) {
-        audioEncoder = new AudioEncoder({
-          output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
-          error: (e) => { console.warn(e); }
-        });
-        audioEncoder.configure({ codec: 'mp4a.40.2', numberOfChannels: 2, sampleRate: 44100, bitrate: 128000 });
-        
-        audioDecoder = new AudioDecoder({
-          output: (frame) => {
-            try { audioEncoder.encode(frame); } catch(e) {}
-            frame.close();
-          },
-          error: (e) => { console.warn(e); }
-        });
-        audioDecoder.configure({
-          codec: audioTrackInfo.codec,
-          numberOfChannels: audioTrackInfo.channels,
-          sampleRate: audioTrackInfo.sampleRate
-        });
-      }
+      let useWebGL = false;
+      let vTrackId = null;
+      let aTrackId = null;
+      let encoderError = null;
+      let decoderError = null;
       
       const mp4boxFile = MP4Box.createFile();
       
+      mp4boxFile.onReady = (info) => {
+        const vTrack = info.tracks.find(t => t.type === 'video');
+        const aTrack = info.tracks.find(t => t.type === 'audio');
+        let hasAudio = !!aTrack;
+        
+        target = new ArrayBufferTarget();
+        muxer = new Muxer({
+          target,
+          video: { codec: 'avc', width: outWidth, height: outHeight },
+          audio: hasAudio ? { codec: 'aac', numberOfChannels: 2, sampleRate: 44100 } : undefined,
+          fastStart: 'in-memory'
+        });
+        
+        if (vTrack) {
+          vTrackId = vTrack.id;
+          videoEncoder = new VideoEncoder({
+            output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+            error: (e) => { encoderError = e; }
+          });
+          
+          try {
+            videoEncoder.configure({
+              codec: 'avc1.640028',
+              width: outWidth, height: outHeight,
+              bitrate: targetBitrate, framerate: targetFPS,
+              hardwareAcceleration: 'prefer-hardware', latencyMode: 'realtime'
+            });
+            if (videoEncoder.state === 'error') throw new Error('Encoder entered error state');
+          } catch(e) {
+            try {
+              videoEncoder.configure({
+                codec: 'avc1.640028',
+                width: outWidth, height: outHeight,
+                bitrate: targetBitrate, framerate: targetFPS,
+                hardwareAcceleration: 'prefer-software'
+              });
+            } catch (e2) {
+              encoderError = new Error('Encoder configuration failed for both hardware and software: ' + e2.message);
+            }
+          }
+          
+          canvas = new OffscreenCanvas(outWidth, outHeight);
+          gl = canvas.getContext('webgl2', { antialias: false, depth: false, stencil: false, preserveDrawingBuffer: false });
+          
+          if (gl) {
+            try {
+              const vsSource = \`#version 300 es
+              in vec2 a_pos; in vec2 a_tex; out vec2 v_tex;
+              void main() { gl_Position = vec4(a_pos, 0, 1); v_tex = a_tex; }\`;
+              const fsSource = \`#version 300 es
+              precision mediump float; in vec2 v_tex; out vec4 o; uniform sampler2D u;
+              void main() { o = texture(u, v_tex); }\`;
+              
+              const vs = gl.createShader(gl.VERTEX_SHADER); gl.shaderSource(vs, vsSource); gl.compileShader(vs);
+              const fs = gl.createShader(gl.FRAGMENT_SHADER); gl.shaderSource(fs, fsSource); gl.compileShader(fs);
+              const prog = gl.createProgram(); gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog); gl.useProgram(prog);
+              
+              const pb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, pb); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+              const pl = gl.getAttribLocation(prog, 'a_pos'); gl.enableVertexAttribArray(pl); gl.vertexAttribPointer(pl, 2, gl.FLOAT, false, 0, 0);
+              
+              const tb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, tb); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0,1, 1,1, 0,0, 1,0]), gl.STATIC_DRAW);
+              const tl = gl.getAttribLocation(prog, 'a_tex'); gl.enableVertexAttribArray(tl); gl.vertexAttribPointer(tl, 2, gl.FLOAT, false, 0, 0);
+              
+              texture = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, texture);
+              gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+              gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+              gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+              gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+              
+              gl.uniform1i(gl.getUniformLocation(prog, 'u'), 0);
+              gl.viewport(0, 0, outWidth, outHeight);
+              useWebGL = true;
+            } catch(e) { gl = null; }
+          }
+          if (!useWebGL) ctx = canvas.getContext('2d');
+          
+          videoDecoder = new VideoDecoder({
+            output: (frame) => {
+              if (encoderError) { frame.close(); return; }
+              let handledAsync = false;
+              try {
+                if (frame.codedWidth === outWidth && frame.codedHeight === outHeight) {
+                  videoEncoder.encode(frame, { keyFrame: videoEncoder.encodeQueueSize < 2 });
+                } else if (useWebGL) {
+                  gl.bindTexture(gl.TEXTURE_2D, texture);
+                  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame);
+                  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+                  const newFrame = new VideoFrame(canvas, { timestamp: frame.timestamp });
+                  videoEncoder.encode(newFrame, { keyFrame: videoEncoder.encodeQueueSize < 2 });
+                  newFrame.close();
+                } else {
+                  handledAsync = true;
+                  const timestamp = frame.timestamp;
+                  createImageBitmap(frame, { resizeWidth: outWidth, resizeHeight: outHeight }).then(bitmap => {
+                    if (encoderError) { frame.close(); return; }
+                    const newFrame = new VideoFrame(bitmap, { timestamp });
+                    videoEncoder.encode(newFrame, { keyFrame: videoEncoder.encodeQueueSize < 2 });
+                    bitmap.close(); newFrame.close(); frame.close();
+                  }).catch(() => {
+                    if (encoderError) { frame.close(); return; }
+                    ctx.drawImage(frame, 0, 0, outWidth, outHeight);
+                    const newFrame = new VideoFrame(canvas, { timestamp });
+                    videoEncoder.encode(newFrame, { keyFrame: videoEncoder.encodeQueueSize < 2 });
+                    newFrame.close(); frame.close();
+                  });
+                }
+              } catch(e) {
+                 encoderError = e;
+              } finally {
+                 if (!handledAsync) frame.close();
+              }
+            },
+            error: (e) => { decoderError = e; }
+          });
+          
+          try {
+            videoDecoder.configure({
+              codec: vTrack.codec,
+              codedWidth: vTrack.track_width || vTrack.width,
+              codedHeight: vTrack.track_height || vTrack.height,
+              description: vTrack.avcDecoderConfigRecord || undefined,
+              hardwareAcceleration: 'prefer-hardware'
+            });
+            if (videoDecoder.state === 'error') throw new Error('Decoder entered error state');
+          } catch(e) {
+             try {
+               videoDecoder.configure({
+                codec: vTrack.codec,
+                codedWidth: vTrack.track_width || vTrack.width,
+                codedHeight: vTrack.track_height || vTrack.height,
+                description: vTrack.avcDecoderConfigRecord || undefined,
+                hardwareAcceleration: 'prefer-software'
+               });
+             } catch (e2) {
+                decoderError = new Error('Decoder configuration failed for both hardware and software: ' + e2.message);
+             }
+          }
+          mp4boxFile.setExtractionOptions(vTrack.id, null, { nbSamples: 1000000 });
+        }
+        
+        if (hasAudio) {
+          aTrackId = aTrack.id;
+          audioEncoder = new AudioEncoder({
+            output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+            error: (e) => { console.warn(e); }
+          });
+          audioEncoder.configure({ codec: 'mp4a.40.2', numberOfChannels: 2, sampleRate: 44100, bitrate: 128000 });
+          
+          audioDecoder = new AudioDecoder({
+            output: (frame) => {
+              try { audioEncoder.encode(frame); } catch(e) {}
+              frame.close();
+            },
+            error: (e) => { console.warn(e); }
+          });
+          audioDecoder.configure({
+            codec: aTrack.codec,
+            numberOfChannels: aTrack.audio.channel_count,
+            sampleRate: aTrack.audio.sample_rate
+          });
+          mp4boxFile.setExtractionOptions(aTrack.id, null, { nbSamples: 1000000 });
+        }
+        
+        mp4boxFile.start();
+      };
+      
       mp4boxFile.onSamples = (id, user, samples) => {
         if (decoderError || encoderError) return;
-        if (id === videoTrackInfo.id) {
+        if (id === vTrackId && videoDecoder) {
           for (const sample of samples) {
             try {
               const chunk = new EncodedVideoChunk({
@@ -692,7 +711,7 @@ self.onmessage = async (e) => {
               videoDecoder.decode(chunk);
             } catch(e) { decoderError = e; break; }
           }
-        } else if (audioTrackInfo && id === audioTrackInfo.id && audioDecoder) {
+        } else if (id === aTrackId && audioDecoder) {
           for (const sample of samples) {
             try {
               const chunk = new EncodedAudioChunk({
@@ -707,9 +726,7 @@ self.onmessage = async (e) => {
         }
       };
       
-      mp4boxFile.setExtractionOptions(videoTrackInfo.id, null, { nbSamples: 1000000 });
-      if (audioTrackInfo) mp4boxFile.setExtractionOptions(audioTrackInfo.id, null, { nbSamples: 1000000 });
-      mp4boxFile.start();
+      mp4boxFile.onError = (e) => { throw new Error('MP4Box error: ' + e); };
       
       const response = await fetch(fileUrl);
       if (!response.body) throw new Error('No response body');
@@ -729,9 +746,9 @@ self.onmessage = async (e) => {
         offset += value.byteLength;
         
         let waitCount = 0;
-        while (videoDecoder.decodeQueueSize > 15 || videoEncoder.encodeQueueSize > 15) {
+        while (videoDecoder && (videoDecoder.decodeQueueSize > 15 || (videoEncoder && videoEncoder.encodeQueueSize > 15))) {
           if (decoderError || encoderError) throw new Error('Codec error during wait');
-          if (videoDecoder.state === 'error' || videoEncoder.state === 'error') throw new Error('Codec entered error state');
+          if (videoDecoder.state === 'error' || (videoEncoder && videoEncoder.state === 'error')) throw new Error('Codec entered error state');
           await new Promise(r => setTimeout(r, 5));
           waitCount++;
           if (waitCount > 1000) throw new Error('Timeout waiting for codec queue to drain');
@@ -740,15 +757,15 @@ self.onmessage = async (e) => {
       mp4boxFile.flush();
       
       let flushWait = 0;
-      while (videoDecoder.decodeQueueSize > 0 || videoDecoder.state === 'configured') {
+      while (videoDecoder && (videoDecoder.decodeQueueSize > 0 || videoDecoder.state === 'configured')) {
         if (decoderError || encoderError) break;
         if (videoDecoder.state === 'error') break;
         await new Promise(r => setTimeout(r, 10));
         flushWait++;
         if (flushWait > 500) break;
       }
-      try { await videoDecoder.flush(); } catch(e) {}
-      try { videoDecoder.close(); } catch(e) {}
+      try { if (videoDecoder) await videoDecoder.flush(); } catch(e) {}
+      try { if (videoDecoder) videoDecoder.close(); } catch(e) {}
       
       if (audioDecoder) {
         try { await audioDecoder.flush(); } catch(e) {}
@@ -756,22 +773,22 @@ self.onmessage = async (e) => {
       }
       
       let encWait = 0;
-      while (videoEncoder.encodeQueueSize > 0 || videoEncoder.state === 'configured') {
+      while (videoEncoder && (videoEncoder.encodeQueueSize > 0 || videoEncoder.state === 'configured')) {
         if (encoderError) break;
         if (videoEncoder.state === 'error') break;
         await new Promise(r => setTimeout(r, 10));
         encWait++;
         if (encWait > 500) break;
       }
-      try { await videoEncoder.flush(); } catch(e) {}
-      try { videoEncoder.close(); } catch(e) {}
+      try { if (videoEncoder) await videoEncoder.flush(); } catch(e) {}
+      try { if (videoEncoder) videoEncoder.close(); } catch(e) {}
       
       if (audioEncoder) {
         try { await audioEncoder.flush(); } catch(e) {}
         try { audioEncoder.close(); } catch(e) {}
       }
       
-      await muxer.finalize();
+      if (muxer) await muxer.finalize();
       
       const bufferOut = target.buffer;
       self.postMessage({ type: 'done', id, buffer: bufferOut }, [bufferOut]);
@@ -1337,11 +1354,7 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
     }
   }
   
-  // 2. Track Info for WebCodecs
-  updateProgress(0.1, 'Inspecting metadata...');
-  const trackInfos = await Promise.all(mp4Files.map(f => getTrackInfo(f)));
-  
-  // 3. Parallel WebCodecs Pool
+  // 2. Parallel WebCodecs Pool
   const targetFPS = isAndroid ? 24 : 30;
   const targetBitrate = isAndroid ? 2_500_000 : 5_000_000;
   
@@ -1362,7 +1375,6 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
        while (activeTasks < MAX_ACTIVE && nextFileIdx < mp4Files.length) {
          const idx = nextFileIdx++;
          const file = mp4Files[idx];
-         const trackInfo = trackInfos[idx];
          const fileUrl = URL.createObjectURL(file);
          activeTasks++;
          
@@ -1370,7 +1382,7 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
          const timeoutId = setTimeout(() => {
             worker.terminate();
             workers[idx % MAX_ACTIVE] = new Worker(workerUrl);
-            processFallback(idx, file, trackInfo, fileUrl, timeoutId); 
+            processFallback(idx, file, fileUrl, timeoutId); 
          }, 180000); 
          
          const onMessage = (e) => {
@@ -1386,8 +1398,7 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
              else startNext();
            } else if (e.data.type === 'error') {
              clearTimeout(timeoutId);
-             // processFallback handles revoking fileUrl
-             processFallback(idx, file, trackInfo, fileUrl, timeoutId, e.data.msg);
+             processFallback(idx, file, fileUrl, timeoutId, e.data.msg);
            }
          };
          
@@ -1400,18 +1411,17 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
             outWidth: parseInt(outWidth),
             outHeight: parseInt(outHeight),
             targetFPS,
-            targetBitrate,
-            hasAudio: trackInfo.hasAudio,
-            videoTrackInfo: trackInfo.videoTrack,
-            audioTrackInfo: trackInfo.audioTrack
+            targetBitrate
          });
        }
     };
     
-    const processFallback = async (idx, file, trackInfo, fileUrl, timeoutId, errMsg) => {
+    const processFallback = async (idx, file, fileUrl, timeoutId, errMsg) => {
        if (fileUrl) URL.revokeObjectURL(fileUrl);
        if (errMsg) console.warn(`WebCodecs failed for ${idx}, falling back to FFmpeg: ${errMsg}`);
        try {
+         // Only inspect metadata here if it fell back to FFmpeg to avoid blocking parallel pool
+         const trackInfo = await getTrackInfo(file); 
          const mountDir = `/fallback_${idx}`;
          await ffmpegInstance.createDir(mountDir).catch(()=>{});
          await ffmpegInstance.mount('WORKERFS', { files: [file] }, mountDir);
