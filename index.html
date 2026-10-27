@@ -841,48 +841,84 @@ const counter = document.getElementById('counter');
 const resolution = document.getElementById('resolution');
 const warning = document.getElementById('warning');
 
-// --- NEW: DYNAMIC FFMPEG WRAPPER PATCHER ---
+// --- ROBUST FFMPEG LOADER & WORKER INTERCEPTOR ---
 async function loadFFmpegLibrary() {
     if (window.__FFMPEG_LIB_LOADED__) return;
     window.__FFMPEG_LIB_LOADED__ = true;
 
     const ffmpegUrl = "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js";
+    
+    // 1. Intercept Worker creation to bypass cross-origin restrictions globally
+    const OriginalWorker = window.Worker;
+    window.Worker = function(url, options) {
+        try {
+            if (window.__FFMPEG_WRAPPER_WORKER_CDN_URL__ && window.__FFMPEG_WORKER_URL__) {
+                let urlStr = '';
+                if (url instanceof URL) urlStr = url.href;
+                else if (typeof url === 'string') urlStr = new URL(url, document.baseURI).href;
+                
+                // If the library tries to load the cross-origin wrapper worker, redirect it!
+                if (urlStr === window.__FFMPEG_WRAPPER_WORKER_CDN_URL__) {
+                    console.log("Intercepted cross-origin FFmpeg worker, redirecting to safe Blob URL.");
+                    return new OriginalWorker(window.__FFMPEG_WORKER_URL__, options);
+                }
+            }
+        } catch(e) {}
+        return new OriginalWorker(url, options);
+    };
+
     try {
+        // 2. Fetch the main script to find the worker chunk ID
         const ffmpegResp = await fetch(ffmpegUrl);
         if (!ffmpegResp.ok) throw new Error("Failed to fetch ffmpeg.js");
-        let ffmpegJS = await ffmpegResp.text();
+        const ffmpegJS = await ffmpegResp.text();
 
-        const chunkMatch = ffmpegJS.match(/u\((\d+)\)/);
-        if (chunkMatch) {
-            const chunkId = chunkMatch[1];
-            const workerUrl = `https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/${chunkId}.ffmpeg.js`;
-            const workerResp = await fetch(workerUrl);
-            if (!workerResp.ok) throw new Error("Failed to fetch ffmpeg worker chunk");
-            const workerBlob = await workerResp.blob();
-            window.__FFMPEG_WORKER_URL__ = URL.createObjectURL(workerBlob);
-            
-            // Replace the cross-origin worker creation with our local blob URL
-            ffmpegJS = ffmpegJS.replace(/new URL\(e\.p\+e\.u\(\d+\),e\.b\)/g, 'window.__FFMPEG_WORKER_URL__');
-            
-            // Inject as a blob script to bypass any CSP inline-script restrictions
-            const modifiedBlob = new Blob([ffmpegJS], { type: 'application/javascript' });
-            const scriptUrl = URL.createObjectURL(modifiedBlob);
-            
-            const script = document.createElement('script');
-            script.src = scriptUrl;
-            document.head.appendChild(script);
-            
-            await new Promise(r => setTimeout(r, 50));
-        } else {
-            console.warn("Could not find ffmpeg worker chunk ID in UMD build. Falling back to direct script tag.");
-            const script = document.createElement('script');
-            script.src = ffmpegUrl;
-            script.crossOrigin = "anonymous";
-            document.head.appendChild(script);
-            await new Promise(r => setTimeout(r, 500));
+        // Robustly find the chunk ID (handles literals like u(814) or variables like u(t))
+        let chunkId = '814'; // Default fallback for 0.12.10
+        const uCallMatch = ffmpegJS.match(/(?:^|[^a-zA-Z0-9_])u\(\s*([a-zA-Z0-9_]+)\s*\)/);
+        if (uCallMatch) {
+            const arg = uCallMatch[1];
+            if (/^\d+$/.test(arg)) {
+                chunkId = arg;
+            } else {
+                const varMatch = ffmpegJS.match(new RegExp(`${arg}\\s*=\\s*(\\d+)`));
+                if (varMatch) chunkId = varMatch[1];
+            }
         }
+
+        // 3. Fetch the worker chunk and create a same-origin Blob URL
+        const workerUrl = `https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/${chunkId}.ffmpeg.js`;
+        window.__FFMPEG_WRAPPER_WORKER_CDN_URL__ = workerUrl;
+        
+        const workerResp = await fetch(workerUrl);
+        if (!workerResp.ok) throw new Error("Failed to fetch ffmpeg worker chunk");
+        const workerBlob = await workerResp.blob();
+        window.__FFMPEG_WORKER_URL__ = URL.createObjectURL(workerBlob);
+        
+        // 4. Inject the original UMD script (it will be intercepted when it tries to load the worker)
+        const script = document.createElement('script');
+        script.src = ffmpegUrl;
+        script.crossOrigin = "anonymous";
+        
+        await new Promise((resolve, reject) => {
+            script.onload = resolve;
+            script.onerror = reject;
+            document.head.appendChild(script);
+        });
+
+        if (typeof FFmpegWASM === 'undefined') {
+            throw new Error("FFmpegWASM failed to initialize.");
+        }
+        console.log("FFmpeg library patched and loaded successfully.");
+
     } catch (e) {
         console.error("Failed to dynamically load ffmpeg.js library", e);
+        // Fallback to direct load if patching fails
+        const script = document.createElement('script');
+        script.src = ffmpegUrl;
+        script.crossOrigin = "anonymous";
+        document.head.appendChild(script);
+        await new Promise(r => setTimeout(r, 1000));
     }
 }
 
