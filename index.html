@@ -865,7 +865,7 @@ self.onmessage = async (e) => {
     };
     const exec = ({ args, timeout = -1 }) => {
         ffmpeg.setTimeout(timeout);
-        ffmpeg.exec(...args);
+        ffmpeg.exec(args);
         const ret = ffmpeg.ret;
         ffmpeg.reset();
         return ret;
@@ -991,6 +991,7 @@ if (isAndroid) {
 
 let ffmpeg = null;
 let ffmpegLoaded = false;
+let ffmpegST = null; // Dedicated single-threaded instance to prevent deadlocks
 
 let ffmpegLock = Promise.resolve();
 let currentFallbackMsg = '';
@@ -1007,6 +1008,46 @@ function getFFmpeg() {
     }
   }
   return ffmpeg;
+}
+
+async function getSTFFmpeg() {
+  if (!ffmpegST) {
+    if (typeof FFmpegWASM === 'undefined') {
+      throw new Error('FFmpeg library failed to load from CDN.');
+    }
+    try {
+      ffmpegST = new FFmpegWASM.FFmpeg();
+    } catch (e) {
+      throw new Error('Failed to initialize FFmpeg: ' + e.message);
+    }
+    
+    ffmpegST.on('log', ({ message }) => {
+      logEl.style.display = 'block';
+      const line = document.createElement('div');
+      line.textContent = message;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+    });
+
+    ffmpegST.on('progress', ({ progress: p }) => {
+      const percent = Math.min(100, Math.max(0, p * 100));
+      progress.value = percent;
+      if (currentFallbackMsg) {
+          statusEl.textContent = `${currentFallbackMsg} (${percent.toFixed(0)}%)`;
+      }
+    });
+
+    const classWorkerURL = createBundledWorkerURL();
+    const stBaseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd';
+    
+    statusEl.textContent = 'Loading FFmpeg (Single-Threaded for encoding)...';
+    await ffmpegST.load({
+      coreURL: await toBlobURL(`${stBaseURL}/ffmpeg-core.js`, 'text/javascript'),
+      wasmURL: await toBlobURL(`${stBaseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+      classWorkerURL
+    });
+  }
+  return ffmpegST;
 }
 
 async function toBlobURL(url, mimeType) {
@@ -1384,21 +1425,24 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
          
          if (file.size > 1.5 * 1024 * 1024 * 1024) throw new Error(`File "${file.name}" is too large (>1.5GB). Browser memory limit exceeded.`);
 
+         // Use the dedicated single-threaded FFmpeg to prevent deadlock on scale + libx264
+         const stFFmpeg = await getSTFFmpeg();
+
          const safeName = file.name.replace(/[^a-z0-9.]/gi, '_').substring(0, 50);
          let filePath = `/fallback_input_${idx}_${safeName}`;
          let isMounted = false;
          
          try {
              const mountPoint = `/mnt_${idx}`;
-             const mounted = await ffmpegInstance.mount('WORKERFS', { files: [file] }, mountPoint);
+             const mounted = await stFFmpeg.mount('WORKERFS', { files: [file] }, mountPoint);
              if (mounted) {
                  filePath = `${mountPoint}/${file.name}`;
                  isMounted = true;
              } else {
-                 await ffmpegInstance.writeFile(filePath, new Uint8Array(await file.arrayBuffer()));
+                 await stFFmpeg.writeFile(filePath, new Uint8Array(await file.arrayBuffer()));
              }
          } catch(e) {
-             await ffmpegInstance.writeFile(filePath, new Uint8Array(await file.arrayBuffer()));
+             await stFFmpeg.writeFile(filePath, new Uint8Array(await file.arrayBuffer()));
          }
          
          const tsName = `fallback_${idx}.ts`;
@@ -1422,7 +1466,7 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
          args.push('-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k');
          args.push('-shortest', '-f', 'mpegts', '-y', tsName);
          
-         let code = await ffmpegInstance.exec(args);
+         let code = await stFFmpeg.exec(args);
          
          if (code !== 0) {
              let retryArgs = ['-fflags', '+genpts', '-i', filePath];
@@ -1434,19 +1478,19 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
              retryArgs.push('-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k');
              retryArgs.push('-shortest', '-f', 'mpegts', '-y', tsName);
              
-             code = await ffmpegInstance.exec(retryArgs);
+             code = await stFFmpeg.exec(retryArgs);
          }
          
          if (code !== 0) throw new Error('FFmpeg fallback failed');
          
-         const data = await ffmpegInstance.readFile(tsName);
+         const data = await stFFmpeg.readFile(tsName);
          results[idx] = { type: 'ts', buffer: data.buffer };
-         await ffmpegInstance.deleteFile(tsName).catch(()=>{});
+         await stFFmpeg.deleteFile(tsName).catch(()=>{});
          
          if (isMounted) {
-             await ffmpegInstance.unmount(`/mnt_${idx}`).catch(()=>{});
+             await stFFmpeg.unmount(`/mnt_${idx}`).catch(()=>{});
          } else {
-             await ffmpegInstance.deleteFile(filePath).catch(()=>{});
+             await stFFmpeg.deleteFile(filePath).catch(()=>{});
          }
          
          finishedTasks++;
