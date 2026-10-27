@@ -1229,6 +1229,16 @@ async function fastFFmpegNativeConcat(filesList) {
   statusEl.textContent = 'Attempting native FFmpeg stream copy concat...';
   progress.value = 15;
   
+  // Track timestamp errors via FFmpeg logs
+  let hasTimestampError = false;
+  const logListener = ({ message }) => {
+    if (message.includes('invalid dropping') || message.includes('Non-monotonous DTS') || message.includes('non monotonous')) {
+      hasTimestampError = true;
+    }
+  };
+  
+  if (typeof ffmpegInstance.on === 'function') ffmpegInstance.on('log', logListener);
+
   const mountDir = '/mnt_native_concat';
   try { await ffmpegInstance.createDir(mountDir); } catch(e) {}
   await ffmpegInstance.mount('WORKERFS', { files: filesList }, mountDir);
@@ -1245,17 +1255,31 @@ async function fastFFmpegNativeConcat(filesList) {
   const ext = isAllWebM ? 'webm' : 'mp4';
   const outName = `fast_native.${ext}`;
   
-  const args = ['-f', 'concat', '-safe', '0', '-i', 'native_concat.txt', '-c', 'copy'];
+  // Added -fflags +genpts and -avoid_negative_ts make_zero to try and salvage stream copy
+  const args = [
+    '-fflags', '+genpts',
+    '-avoid_negative_ts', 'make_zero',
+    '-f', 'concat', '-safe', '0', '-i', 'native_concat.txt', 
+    '-c', 'copy'
+  ];
   if (!isAllWebM) args.push('-movflags', '+faststart');
   args.push('-y', outName);
   
   const code = await ffmpegInstance.exec(args);
+  
+  // Clean up listener if possible
+  if (typeof ffmpegInstance.off === 'function') ffmpegInstance.off('log', logListener);
   
   try { await ffmpegInstance.deleteFile('native_concat.txt'); } catch(e) {}
   await ffmpegInstance.unmount(mountDir).catch(() => {});
   await ffmpegInstance.deleteDir(mountDir).catch(() => {});
   
   if (code === 0) {
+    // If we detected "invalid dropping", throw an error to trigger the re-encoding fallback!
+    if (hasTimestampError) {
+      throw new Error('Native concat produced timestamp errors (invalid dropping). Falling back to re-encode to prevent video glitches.');
+    }
+    
     const data = await ffmpegInstance.readFile(outName);
     if (data && data.length > 10000) {
       try { await ffmpegInstance.deleteFile(outName); } catch(e) {}
