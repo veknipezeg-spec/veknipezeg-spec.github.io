@@ -488,6 +488,11 @@ self.onmessage = async (e) => {
   const { type, fileUrl, outWidth, outHeight, targetFPS, targetBitrate, id, hasAudio } = e.data;
   
   if (type === 'process') {
+    // Global timeout to ensure the worker never hangs silently
+    const jobTimeout = setTimeout(() => {
+       self.postMessage({ type: 'error', id, msg: 'WebCodecs job timeout' });
+    }, 120000); // 2 minutes
+
     try {
       if (typeof MP4Box === 'undefined') {
         try {
@@ -647,7 +652,8 @@ self.onmessage = async (e) => {
         });
         
         if (!videoTrack) {
-           decoderError = new Error('No video track found');
+           clearTimeout(jobTimeout);
+           self.postMessage({ type: 'error', id, msg: 'No video track found in MP4' });
            return;
         }
         
@@ -672,7 +678,8 @@ self.onmessage = async (e) => {
                hardwareAcceleration: 'prefer-software'
              });
            } catch(e2) {
-             decoderError = new Error('Decoder config failed: ' + e2.message);
+             clearTimeout(jobTimeout);
+             self.postMessage({ type: 'error', id, msg: 'Decoder config failed: ' + e2.message });
              return;
            }
         }
@@ -723,7 +730,10 @@ self.onmessage = async (e) => {
         }
       };
       
-      mp4boxFile.onError = (e) => { decoderError = e; };
+      mp4boxFile.onError = (e) => { 
+         clearTimeout(jobTimeout);
+         self.postMessage({ type: 'error', id, msg: 'MP4 parse error: ' + (e.message || String(e)) }); 
+      };
       
       const response = await fetch(fileUrl);
       if (!response.body) throw new Error('No response body');
@@ -787,10 +797,12 @@ self.onmessage = async (e) => {
       
       if (muxer) await muxer.finalize();
       
+      clearTimeout(jobTimeout);
       const bufferOut = target.buffer;
       self.postMessage({ type: 'done', id, buffer: bufferOut, hasAudio: hasActualAudio }, [bufferOut]);
       
     } catch (err) {
+      clearTimeout(jobTimeout);
       self.postMessage({ type: 'error', id, msg: err.message || String(err) });
     }
   }
@@ -1049,7 +1061,6 @@ async function loadFFmpeg() {
     console.warn("Multi-threaded core failed (expected on GitHub Pages due to missing COOP/COEP headers). Falling back to single-thread...", mtErr);
   }
 
-  // FIX: Use 0.12.6 UMD build for stable single-thread fallback
   const stBaseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd';
   
   try {
@@ -1201,24 +1212,40 @@ async function readFileSlice(file, start, end) {
 }
 
 async function inspectMP4FileMetadata(file) {
-  const HEADER_SIZE = Math.min(262144, file.size);
-  const headerBuffer = await readFileSlice(file, 0, HEADER_SIZE);
+  const SLICE_SIZE = Math.min(2097152, file.size); // Read up to 2MB
+  const headerBuffer = await readFileSlice(file, 0, SLICE_SIZE);
   
   const mp4boxFile = MP4Box.createFile();
   
   return new Promise((resolve, reject) => {
-    mp4boxFile.onError = (e) => reject(e);
-    mp4boxFile.onReady = (info) => resolve(info);
+    let settled = false;
+    
+    // 5-second timeout to prevent infinite hanging on bad files
+    const timeoutId = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        reject(new Error('MP4 metadata parsing timeout'));
+      }
+    }, 5000);
+
+    mp4boxFile.onError = (e) => {
+      if (!settled) { settled = true; clearTimeout(timeoutId); reject(e); }
+    };
+    mp4boxFile.onReady = (info) => {
+      if (!settled) { settled = true; clearTimeout(timeoutId); resolve(info); }
+    };
     
     headerBuffer.fileStart = 0;
     mp4boxFile.appendBuffer(headerBuffer);
     mp4boxFile.flush();
     
     setTimeout(() => {
-      if (file.size > HEADER_SIZE) {
-        readFileSlice(file, file.size - Math.min(262144, file.size), file.size)
+      if (file.size > SLICE_SIZE) {
+        const tailStart = file.size - Math.min(2097152, file.size);
+        readFileSlice(file, tailStart, file.size)
           .then(tailBuffer => {
-            tailBuffer.fileStart = file.size - Math.min(262144, file.size);
+            if (settled) return;
+            tailBuffer.fileStart = tailStart;
             mp4boxFile.appendBuffer(tailBuffer);
             mp4boxFile.flush();
           })
@@ -1338,61 +1365,11 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
   await new Promise((resolve, reject) => {
     let finishedTasks = 0;
     
-    const startNext = () => {
-       while (activeTasks < MAX_ACTIVE && nextFileIdx < filesList.length) {
-         const idx = nextFileIdx++;
-         const file = filesList[idx];
-         const fileUrl = URL.createObjectURL(file);
-         activeTasks++;
-         
-         const trackInfoPromise = getTrackInfo(file);
-         
-         const worker = workers[idx % MAX_ACTIVE]; 
-         const timeoutId = setTimeout(() => {
-            worker.terminate();
-            workers[idx % MAX_ACTIVE] = new Worker(workerUrl);
-            processFallback(idx, file, trackInfoPromise, fileUrl, timeoutId); 
-         }, 180000); 
-         
-         const onMessage = (e) => {
-           if (e.data.id !== idx) return; 
-           if (e.data.type === 'done') {
-             clearTimeout(timeoutId);
-             results[idx] = { type: 'mp4', buffer: e.data.buffer, hasAudio: e.data.hasAudio };
-             URL.revokeObjectURL(fileUrl);
-             finishedTasks++;
-             activeTasks--;
-             updateProgress(0.2 + (finishedTasks / filesList.length) * 0.6, `Parallel encoding: ${finishedTasks}/${filesList.length} done`);
-             if (finishedTasks === filesList.length) resolve();
-             else startNext();
-           } else if (e.data.type === 'error') {
-             clearTimeout(timeoutId);
-             processFallback(idx, file, trackInfoPromise, fileUrl, timeoutId, e.data.msg);
-           }
-         };
-         
-         worker.onmessage = onMessage;
-         
-         worker.postMessage({
-            type: 'process',
-            id: idx,
-            fileUrl,
-            outWidth: parseInt(outWidth),
-            outHeight: parseInt(outHeight),
-            targetFPS,
-            targetBitrate,
-            hasAudio: true, 
-            videoTrackInfo: null, 
-            audioTrackInfo: null  
-         });
-       }
-    };
-    
-    const processFallback = async (idx, file, trackInfoPromise, fileUrl, timeoutId, errMsg) => {
+    const processFallback = async (idx, file, trackInfo, fileUrl, timeoutId, errMsg) => {
+       if (timeoutId) clearTimeout(timeoutId);
        if (fileUrl) URL.revokeObjectURL(fileUrl);
        if (errMsg) console.warn(`WebCodecs failed for ${idx}, falling back to FFmpeg: ${errMsg}`);
        try {
-         const trackInfo = await trackInfoPromise;
          const mountDir = `/fallback_${idx}`;
          await ffmpegInstance.createDir(mountDir).catch(()=>{});
          await ffmpegInstance.mount('WORKERFS', { files: [file] }, mountDir);
@@ -1449,8 +1426,64 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
          if (finishedTasks === filesList.length) resolve();
          else startNext();
        } catch(e) {
-         clearTimeout(timeoutId);
+         if (timeoutId) clearTimeout(timeoutId);
          reject(e);
+       }
+    };
+
+    const startNext = async () => {
+       while (activeTasks < MAX_ACTIVE && nextFileIdx < filesList.length) {
+         const idx = nextFileIdx++;
+         const file = filesList[idx];
+         const fileUrl = URL.createObjectURL(file);
+         activeTasks++;
+         
+         const trackInfo = await getTrackInfo(file);
+         
+         const worker = workers[idx % MAX_ACTIVE]; 
+         // Reduced timeout from 180000 (3m) to 90000 (90s)
+         const timeoutId = setTimeout(() => {
+            worker.terminate();
+            workers[idx % MAX_ACTIVE] = new Worker(workerUrl);
+            processFallback(idx, file, trackInfo, fileUrl, timeoutId); 
+         }, 90000); 
+         
+         // IMMEDIATE FALLBACK: If it's not an MP4 or couldn't be parsed, WebCodecs will fail. Skip it.
+         if (!trackInfo.isMP4 || !trackInfo.parsed) {
+            processFallback(idx, file, trackInfo, fileUrl, timeoutId);
+            return;
+         }
+         
+         const onMessage = (e) => {
+           if (e.data.id !== idx) return; 
+           if (e.data.type === 'done') {
+             clearTimeout(timeoutId);
+             results[idx] = { type: 'mp4', buffer: e.data.buffer, hasAudio: e.data.hasAudio };
+             URL.revokeObjectURL(fileUrl);
+             finishedTasks++;
+             activeTasks--;
+             updateProgress(0.2 + (finishedTasks / filesList.length) * 0.6, `Parallel encoding: ${finishedTasks}/${filesList.length} done`);
+             if (finishedTasks === filesList.length) resolve();
+             else startNext();
+           } else if (e.data.type === 'error') {
+             processFallback(idx, file, trackInfo, fileUrl, timeoutId, e.data.msg);
+           }
+         };
+         
+         worker.onmessage = onMessage;
+         
+         worker.postMessage({
+            type: 'process',
+            id: idx,
+            fileUrl,
+            outWidth: parseInt(outWidth),
+            outHeight: parseInt(outHeight),
+            targetFPS,
+            targetBitrate,
+            hasAudio: true, 
+            videoTrackInfo: null, 
+            audioTrackInfo: null  
+         });
        }
     };
     
