@@ -497,7 +497,7 @@ self.onmessage = async (e) => {
         try {
           importScripts('https://cdn.jsdelivr.net/npm/mp4box@0.4.4/dist/mp4box.all.min.js');
         } catch (e) {
-          throw new Error('Failed to load MP4Box: ' + e.message);
+          throw new Error('Failed to load MP4Box: ' + (e.message || String(e)));
         }
       }
       
@@ -532,8 +532,12 @@ self.onmessage = async (e) => {
             hardwareAcceleration: 'prefer-software'
           });
         } catch (e2) {
-          throw new Error('Encoder configuration failed for both hardware and software: ' + e2.message);
+          throw new Error('Encoder configuration failed for both hardware and software: ' + (e2.message || String(e2)));
         }
+      }
+      
+      if (typeof OffscreenCanvas === 'undefined') {
+        throw new Error('OffscreenCanvas not supported in this browser worker context');
       }
       
       let canvas = new OffscreenCanvas(outWidth, outHeight);
@@ -678,7 +682,7 @@ self.onmessage = async (e) => {
              });
            } catch(e2) {
              clearTimeout(jobTimeout);
-             self.postMessage({ type: 'error', id, msg: 'Decoder config failed: ' + e2.message });
+             self.postMessage({ type: 'error', id, msg: 'Decoder config failed: ' + (e2.message || String(e2)) });
              return;
            }
         }
@@ -687,8 +691,8 @@ self.onmessage = async (e) => {
            try {
              audioDecoder.configure({
                codec: audioTrack.codec,
-               numberOfChannels: audioTrack.audio.channel_count,
-               sampleRate: audioTrack.audio.sample_rate
+               numberOfChannels: audioTrack.audio?.channel_count || 2,
+               sampleRate: audioTrack.audio?.sample_rate || 44100
              });
            } catch(e) {
              console.warn('Audio decoder config failed', e);
@@ -970,6 +974,14 @@ const counter = document.getElementById('counter');
 const resolution = document.getElementById('resolution');
 const warning = document.getElementById('warning');
 
+function getErrorMessage(err) {
+  if (!err) return 'Unknown error';
+  if (err instanceof Error) return err.message;
+  if (typeof err === 'string') return err;
+  if (err.message) return err.message;
+  return String(err);
+}
+
 if (isAndroid) {
   const currentVal = resolution.value;
   const maxMobileRes = '1280:720';
@@ -1004,7 +1016,7 @@ function getFFmpeg() {
     try {
       ffmpeg = new FFmpegWASM.FFmpeg();
     } catch (e) {
-      throw new Error('Failed to initialize FFmpeg: ' + e.message);
+      throw new Error('Failed to initialize FFmpeg: ' + getErrorMessage(e));
     }
   }
   return ffmpeg;
@@ -1018,7 +1030,7 @@ async function getSTFFmpeg() {
     try {
       ffmpegST = new FFmpegWASM.FFmpeg();
     } catch (e) {
-      throw new Error('Failed to initialize FFmpeg: ' + e.message);
+      throw new Error('Failed to initialize FFmpeg: ' + getErrorMessage(e));
     }
     
     ffmpegST.on('log', ({ message }) => {
@@ -1120,9 +1132,9 @@ async function loadFFmpeg() {
     statusEl.textContent = 'FFmpeg Single-Threaded ready';
     
   } catch (stErr) {
-    statusEl.textContent = 'Failed to load FFmpeg: ' + stErr.message;
+    statusEl.textContent = 'Failed to load FFmpeg: ' + getErrorMessage(stErr);
     logEl.style.display = 'block';
-    logEl.textContent = stErr.message + '\n\n' + (stErr.stack || '');
+    logEl.textContent = getErrorMessage(stErr) + '\n\n' + (stErr.stack || '');
     throw new Error('FFmpeg library failed to load from CDN.');
   }
 }
@@ -1304,7 +1316,7 @@ async function getTrackInfo(file) {
     return {
       hasVideo: !!videoTrack, hasAudio: !!audioTrack, duration: info.duration || 0, isMP4: true, parsed: true,
       videoTrack: videoTrack ? { id: videoTrack.id, codec: videoTrack.codec, width: videoTrack.track_width || videoTrack.width, height: videoTrack.track_height || videoTrack.height, description: videoTrack.avcDecoderConfigRecord } : null,
-      audioTrack: audioTrack ? { id: audioTrack.id, codec: audioTrack.codec, channels: audioTrack.audio.channel_count, sampleRate: audioTrack.audio.sample_rate } : null
+      audioTrack: audioTrack ? { id: audioTrack.id, codec: audioTrack.codec, channels: audioTrack.audio?.channel_count || 2, sampleRate: audioTrack.audio?.sample_rate || 44100 } : null
     };
   } catch (e) {
     return { hasVideo: true, hasAudio: true, duration: 0, isMP4: true, parsed: false, videoTrack: null, audioTrack: null };
@@ -1359,9 +1371,15 @@ async function fastFFmpegTSConcat(filesList, trackInfos, updateProgress) {
     
     if (code !== 0) {
         let retryArgs = ['-fflags', '+genpts', '-i', filePath];
-        retryArgs.push('-f', 'lavfi', '-t', '86400', '-i', 'anullsrc=r=44100:cl=stereo');
+        if (!trackInfo.hasAudio) {
+            retryArgs.push('-f', 'lavfi', '-t', '86400', '-i', 'anullsrc=r=44100:cl=stereo');
+        }
         retryArgs.push('-map', '0:v:0');
-        retryArgs.push('-map', '1:a:0');
+        if (trackInfo.hasAudio) {
+            retryArgs.push('-map', '0:a:0');
+        } else {
+            retryArgs.push('-map', '1:a:0');
+        }
         retryArgs.push('-c:v', 'copy');
         retryArgs.push('-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k');
         retryArgs.push('-shortest', '-f', 'mpegts', '-y', tsName);
@@ -1425,7 +1443,6 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
          
          if (file.size > 1.5 * 1024 * 1024 * 1024) throw new Error(`File "${file.name}" is too large (>1.5GB). Browser memory limit exceeded.`);
 
-         // Use the dedicated single-threaded FFmpeg to prevent deadlock on scale + libx264
          const stFFmpeg = await getSTFFmpeg();
 
          const safeName = file.name.replace(/[^a-z0-9.]/gi, '_').substring(0, 50);
@@ -1470,9 +1487,15 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
          
          if (code !== 0) {
              let retryArgs = ['-fflags', '+genpts', '-i', filePath];
-             retryArgs.push('-f', 'lavfi', '-t', '86400', '-i', 'anullsrc=r=44100:cl=stereo');
+             if (!trackInfo.hasAudio) {
+               retryArgs.push('-f', 'lavfi', '-t', '86400', '-i', 'anullsrc=r=44100:cl=stereo');
+             }
              retryArgs.push('-map', '0:v:0');
-             retryArgs.push('-map', '1:a:0');
+             if (trackInfo.hasAudio) {
+               retryArgs.push('-map', '0:a:0');
+             } else {
+               retryArgs.push('-map', '1:a:0');
+             }
              retryArgs.push('-vf', videoFilter);
              retryArgs.push('-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-crf', '32', '-pix_fmt', 'yuv420p');
              retryArgs.push('-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k');
@@ -1677,7 +1700,7 @@ mergeBtn.addEventListener('click', async () => {
          await muxer.finalize();
          finalBlob = new Blob([target.buffer], { type: 'video/mp4' });
          updateProgress(1.0, 'Instant merge completed without re-encoding!');
-       } catch(e) { logEl.style.display = 'block'; logEl.textContent += `Instant merge failed: ${e.message}\n`; finalBlob = null; }
+       } catch(e) { logEl.style.display = 'block'; logEl.textContent += `Instant merge failed: ${getErrorMessage(e)}\n`; finalBlob = null; }
     }
 
     if (!finalBlob && allMP4AndCompatible) {
@@ -1685,7 +1708,7 @@ mergeBtn.addEventListener('click', async () => {
          updateProgress(0.1, 'Attempting Fast TS stream copy...');
          const blob = await fastFFmpegTSConcat(files, trackInfos, (ratio, msg) => { updateProgress(0.1 + ratio * 0.8, msg); });
          if (blob && blob.size > 1000) { finalBlob = blob; updateProgress(1.0, 'Fast TS stream copy success!'); }
-      } catch(e) { logEl.style.display = 'block'; logEl.textContent += `Fast TS copy failed: ${e.message}\n`; }
+      } catch(e) { logEl.style.display = 'block'; logEl.textContent += `Fast TS copy failed: ${getErrorMessage(e)}\n`; }
     }
     
     if (!finalBlob) {
@@ -1701,11 +1724,12 @@ mergeBtn.addEventListener('click', async () => {
     statusEl.textContent = `Merge complete! Final video size: ${formatSize(finalBlob.size)}`;
 
   } catch (err) {
-    statusEl.textContent = 'Error: ' + err.message;
+    const msg = getErrorMessage(err);
+    statusEl.textContent = 'Error: ' + msg;
     warning.textContent = 'An error occurred. Check the log for details.';
     warning.style.display = 'block';
     logEl.style.display = 'block';
-    logEl.textContent += '\n\n' + err.message + '\n' + (err.stack || '');
+    logEl.textContent += '\n\n' + msg + '\n' + (err.stack || '');
   } finally {
     mergeBtn.disabled = false; clearBtn.disabled = false; dropZone.style.pointerEvents = 'auto';
   }
