@@ -499,7 +499,7 @@ if ('serviceWorker' in navigator) {
 
 const webCodecsWorkerCode = `
 self.onmessage = async (e) => {
-  const { type, fileUrl, outWidth, outHeight, targetFPS, targetBitrate, id } = e.data;
+  const { type, fileUrl, outWidth, outHeight, targetFPS, targetBitrate, id, hasAudio } = e.data;
   
   if (type === 'process') {
     try {
@@ -513,193 +513,204 @@ self.onmessage = async (e) => {
       
       const { Muxer, ArrayBufferTarget } = await import('https://esm.sh/mp4-muxer@5.0.0');
       
-      let muxer = null;
-      let target = null;
-      let videoEncoder = null;
-      let videoDecoder = null;
-      let audioEncoder = null;
-      let audioDecoder = null;
-      let canvas = null;
-      let gl = null;
-      let ctx = null;
-      let texture = null;
-      let useWebGL = false;
-      let vTrackId = null;
-      let aTrackId = null;
+      const target = new ArrayBufferTarget();
+      
       let encoderError = null;
       let decoderError = null;
+
+      const videoEncoder = new VideoEncoder({
+        output: (chunk, meta) => muxer ? muxer.addVideoChunk(chunk, meta) : null,
+        error: (e) => { encoderError = e; }
+      });
+      
+      let hwFailed = false;
+      try {
+        videoEncoder.configure({
+          codec: 'avc1.640028',
+          width: outWidth, height: outHeight,
+          bitrate: targetBitrate, framerate: targetFPS,
+          hardwareAcceleration: 'prefer-hardware', latencyMode: 'realtime'
+        });
+        if (videoEncoder.state === 'error') throw new Error('Encoder entered error state');
+      } catch(e) {
+        hwFailed = true;
+        try {
+          videoEncoder.configure({
+            codec: 'avc1.640028',
+            width: outWidth, height: outHeight,
+            bitrate: targetBitrate, framerate: targetFPS,
+            hardwareAcceleration: 'prefer-software'
+          });
+        } catch (e2) {
+          throw new Error('Encoder configuration failed for both hardware and software: ' + e2.message);
+        }
+      }
+      
+      let canvas = new OffscreenCanvas(outWidth, outHeight);
+      let gl = canvas.getContext('webgl2', { antialias: false, depth: false, stencil: false, preserveDrawingBuffer: false });
+      let useWebGL = false;
+      let ctx = null;
+      let texture = null;
+      
+      if (gl) {
+        try {
+          const vsSource = \`#version 300 es
+          in vec2 a_pos; in vec2 a_tex; out vec2 v_tex;
+          void main() { gl_Position = vec4(a_pos, 0, 1); v_tex = a_tex; }\`;
+          const fsSource = \`#version 300 es
+          precision mediump float; in vec2 v_tex; out vec4 o; uniform sampler2D u;
+          void main() { o = texture(u, v_tex); }\`;
+          
+          const vs = gl.createShader(gl.VERTEX_SHADER); gl.shaderSource(vs, vsSource); gl.compileShader(vs);
+          const fs = gl.createShader(gl.FRAGMENT_SHADER); gl.shaderSource(fs, fsSource); gl.compileShader(fs);
+          const prog = gl.createProgram(); gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog); gl.useProgram(prog);
+          
+          const pb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, pb); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+          const pl = gl.getAttribLocation(prog, 'a_pos'); gl.enableVertexAttribArray(pl); gl.vertexAttribPointer(pl, 2, gl.FLOAT, false, 0, 0);
+          
+          const tb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, tb); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0,1, 1,1, 0,0, 1,0]), gl.STATIC_DRAW);
+          const tl = gl.getAttribLocation(prog, 'a_tex'); gl.enableVertexAttribArray(tl); gl.vertexAttribPointer(tl, 2, gl.FLOAT, false, 0, 0);
+          
+          texture = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, texture);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+          
+          gl.uniform1i(gl.getUniformLocation(prog, 'u'), 0);
+          gl.viewport(0, 0, outWidth, outHeight);
+          useWebGL = true;
+        } catch(e) { gl = null; }
+      }
+      if (!useWebGL) ctx = canvas.getContext('2d');
+      
+      const videoDecoder = new VideoDecoder({
+        output: (frame) => {
+          if (encoderError) { frame.close(); return; }
+          let handledAsync = false;
+          try {
+            if (frame.codedWidth === outWidth && frame.codedHeight === outHeight) {
+              videoEncoder.encode(frame, { keyFrame: videoEncoder.encodeQueueSize < 2 });
+            } else if (useWebGL) {
+              gl.bindTexture(gl.TEXTURE_2D, texture);
+              gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame);
+              gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+              const newFrame = new VideoFrame(canvas, { timestamp: frame.timestamp });
+              videoEncoder.encode(newFrame, { keyFrame: videoEncoder.encodeQueueSize < 2 });
+              newFrame.close();
+            } else {
+              handledAsync = true;
+              const timestamp = frame.timestamp;
+              createImageBitmap(frame, { resizeWidth: outWidth, resizeHeight: outHeight }).then(bitmap => {
+                if (encoderError) { frame.close(); return; }
+                const newFrame = new VideoFrame(bitmap, { timestamp });
+                videoEncoder.encode(newFrame, { keyFrame: videoEncoder.encodeQueueSize < 2 });
+                bitmap.close(); newFrame.close(); frame.close();
+              }).catch(() => {
+                if (encoderError) { frame.close(); return; }
+                ctx.drawImage(frame, 0, 0, outWidth, outHeight);
+                const newFrame = new VideoFrame(canvas, { timestamp });
+                videoEncoder.encode(newFrame, { keyFrame: videoEncoder.encodeQueueSize < 2 });
+                newFrame.close(); frame.close();
+              });
+            }
+          } catch(e) {
+             encoderError = e;
+          } finally {
+             if (!handledAsync) frame.close();
+          }
+        },
+        error: (e) => { decoderError = e; }
+      });
+      
+      let audioDecoder = null;
+      let audioEncoder = null;
+      
+      if (hasAudio) {
+        audioEncoder = new AudioEncoder({
+          output: (chunk, meta) => muxer ? muxer.addAudioChunk(chunk, meta) : null,
+          error: (e) => { console.warn(e); }
+        });
+        audioEncoder.configure({ codec: 'mp4a.40.2', numberOfChannels: 2, sampleRate: 44100, bitrate: 128000 });
+        
+        audioDecoder = new AudioDecoder({
+          output: (frame) => {
+            try { audioEncoder.encode(frame); } catch(e) {}
+            frame.close();
+          },
+          error: (e) => { console.warn(e); }
+        });
+      }
       
       const mp4boxFile = MP4Box.createFile();
+      let muxer = null;
+      let videoTrackId = -1;
+      let audioTrackId = -1;
+      let hasActualAudio = false;
       
       mp4boxFile.onReady = (info) => {
-        const vTrack = info.tracks.find(t => t.type === 'video');
-        const aTrack = info.tracks.find(t => t.type === 'audio');
-        let hasAudio = !!aTrack;
+        const videoTrack = info.tracks.find(t => t.type === 'video');
+        const audioTrack = info.tracks.find(t => t.type === 'audio');
+        hasActualAudio = !!(audioTrack && hasAudio);
         
-        target = new ArrayBufferTarget();
         muxer = new Muxer({
           target,
           video: { codec: 'avc', width: outWidth, height: outHeight },
-          audio: hasAudio ? { codec: 'aac', numberOfChannels: 2, sampleRate: 44100 } : undefined,
+          audio: hasActualAudio ? { codec: 'aac', numberOfChannels: 2, sampleRate: 44100 } : undefined,
           fastStart: 'in-memory'
         });
         
-        if (vTrack) {
-          vTrackId = vTrack.id;
-          videoEncoder = new VideoEncoder({
-            output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
-            error: (e) => { encoderError = e; }
-          });
-          
-          try {
-            videoEncoder.configure({
-              codec: 'avc1.640028',
-              width: outWidth, height: outHeight,
-              bitrate: targetBitrate, framerate: targetFPS,
-              hardwareAcceleration: 'prefer-hardware', latencyMode: 'realtime'
-            });
-            if (videoEncoder.state === 'error') throw new Error('Encoder entered error state');
-          } catch(e) {
-            try {
-              videoEncoder.configure({
-                codec: 'avc1.640028',
-                width: outWidth, height: outHeight,
-                bitrate: targetBitrate, framerate: targetFPS,
-                hardwareAcceleration: 'prefer-software'
-              });
-            } catch (e2) {
-              encoderError = new Error('Encoder configuration failed for both hardware and software: ' + e2.message);
-            }
-          }
-          
-          canvas = new OffscreenCanvas(outWidth, outHeight);
-          gl = canvas.getContext('webgl2', { antialias: false, depth: false, stencil: false, preserveDrawingBuffer: false });
-          
-          if (gl) {
-            try {
-              const vsSource = \`#version 300 es
-              in vec2 a_pos; in vec2 a_tex; out vec2 v_tex;
-              void main() { gl_Position = vec4(a_pos, 0, 1); v_tex = a_tex; }\`;
-              const fsSource = \`#version 300 es
-              precision mediump float; in vec2 v_tex; out vec4 o; uniform sampler2D u;
-              void main() { o = texture(u, v_tex); }\`;
-              
-              const vs = gl.createShader(gl.VERTEX_SHADER); gl.shaderSource(vs, vsSource); gl.compileShader(vs);
-              const fs = gl.createShader(gl.FRAGMENT_SHADER); gl.shaderSource(fs, fsSource); gl.compileShader(fs);
-              const prog = gl.createProgram(); gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog); gl.useProgram(prog);
-              
-              const pb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, pb); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
-              const pl = gl.getAttribLocation(prog, 'a_pos'); gl.enableVertexAttribArray(pl); gl.vertexAttribPointer(pl, 2, gl.FLOAT, false, 0, 0);
-              
-              const tb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, tb); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0,1, 1,1, 0,0, 1,0]), gl.STATIC_DRAW);
-              const tl = gl.getAttribLocation(prog, 'a_tex'); gl.enableVertexAttribArray(tl); gl.vertexAttribPointer(tl, 2, gl.FLOAT, false, 0, 0);
-              
-              texture = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, texture);
-              gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-              gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-              gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-              gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-              
-              gl.uniform1i(gl.getUniformLocation(prog, 'u'), 0);
-              gl.viewport(0, 0, outWidth, outHeight);
-              useWebGL = true;
-            } catch(e) { gl = null; }
-          }
-          if (!useWebGL) ctx = canvas.getContext('2d');
-          
-          videoDecoder = new VideoDecoder({
-            output: (frame) => {
-              if (encoderError) { frame.close(); return; }
-              let handledAsync = false;
-              try {
-                if (frame.codedWidth === outWidth && frame.codedHeight === outHeight) {
-                  videoEncoder.encode(frame, { keyFrame: videoEncoder.encodeQueueSize < 2 });
-                } else if (useWebGL) {
-                  gl.bindTexture(gl.TEXTURE_2D, texture);
-                  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame);
-                  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-                  const newFrame = new VideoFrame(canvas, { timestamp: frame.timestamp });
-                  videoEncoder.encode(newFrame, { keyFrame: videoEncoder.encodeQueueSize < 2 });
-                  newFrame.close();
-                } else {
-                  handledAsync = true;
-                  const timestamp = frame.timestamp;
-                  createImageBitmap(frame, { resizeWidth: outWidth, resizeHeight: outHeight }).then(bitmap => {
-                    if (encoderError) { frame.close(); return; }
-                    const newFrame = new VideoFrame(bitmap, { timestamp });
-                    videoEncoder.encode(newFrame, { keyFrame: videoEncoder.encodeQueueSize < 2 });
-                    bitmap.close(); newFrame.close(); frame.close();
-                  }).catch(() => {
-                    if (encoderError) { frame.close(); return; }
-                    ctx.drawImage(frame, 0, 0, outWidth, outHeight);
-                    const newFrame = new VideoFrame(canvas, { timestamp });
-                    videoEncoder.encode(newFrame, { keyFrame: videoEncoder.encodeQueueSize < 2 });
-                    newFrame.close(); frame.close();
-                  });
-                }
-              } catch(e) {
-                 encoderError = e;
-              } finally {
-                 if (!handledAsync) frame.close();
-              }
-            },
-            error: (e) => { decoderError = e; }
-          });
-          
-          try {
-            videoDecoder.configure({
-              codec: vTrack.codec,
-              codedWidth: vTrack.track_width || vTrack.width,
-              codedHeight: vTrack.track_height || vTrack.height,
-              description: vTrack.avcDecoderConfigRecord || undefined,
-              hardwareAcceleration: 'prefer-hardware'
-            });
-            if (videoDecoder.state === 'error') throw new Error('Decoder entered error state');
-          } catch(e) {
-             try {
-               videoDecoder.configure({
-                codec: vTrack.codec,
-                codedWidth: vTrack.track_width || vTrack.width,
-                codedHeight: vTrack.track_height || vTrack.height,
-                description: vTrack.avcDecoderConfigRecord || undefined,
-                hardwareAcceleration: 'prefer-software'
-               });
-             } catch (e2) {
-                decoderError = new Error('Decoder configuration failed for both hardware and software: ' + e2.message);
-             }
-          }
-          mp4boxFile.setExtractionOptions(vTrack.id, null, { nbSamples: 1000000 });
+        if (!videoTrack) {
+           decoderError = new Error('No video track found');
+           return;
         }
         
-        if (hasAudio) {
-          aTrackId = aTrack.id;
-          audioEncoder = new AudioEncoder({
-            output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
-            error: (e) => { console.warn(e); }
+        videoTrackId = videoTrack.id;
+        if (audioTrack) audioTrackId = audioTrack.id;
+        
+        try {
+          videoDecoder.configure({
+            codec: videoTrack.codec,
+            codedWidth: videoTrack.track_width || videoTrack.width,
+            codedHeight: videoTrack.track_height || videoTrack.height,
+            description: videoTrack.avcDecoderConfigRecord || undefined,
+            hardwareAcceleration: 'prefer-hardware'
           });
-          audioEncoder.configure({ codec: 'mp4a.40.2', numberOfChannels: 2, sampleRate: 44100, bitrate: 128000 });
-          
-          audioDecoder = new AudioDecoder({
-            output: (frame) => {
-              try { audioEncoder.encode(frame); } catch(e) {}
-              frame.close();
-            },
-            error: (e) => { console.warn(e); }
-          });
-          audioDecoder.configure({
-            codec: aTrack.codec,
-            numberOfChannels: aTrack.audio.channel_count,
-            sampleRate: aTrack.audio.sample_rate
-          });
-          mp4boxFile.setExtractionOptions(aTrack.id, null, { nbSamples: 1000000 });
+        } catch(e) {
+           try {
+             videoDecoder.configure({
+               codec: videoTrack.codec,
+               codedWidth: videoTrack.track_width || videoTrack.width,
+               codedHeight: videoTrack.track_height || videoTrack.height,
+               description: videoTrack.avcDecoderConfigRecord || undefined,
+               hardwareAcceleration: 'prefer-software'
+             });
+           } catch(e2) {
+             decoderError = new Error('Decoder config failed: ' + e2.message);
+             return;
+           }
         }
         
+        if (audioTrack && hasActualAudio && audioDecoder) {
+           try {
+             audioDecoder.configure({
+               codec: audioTrack.codec,
+               numberOfChannels: audioTrack.audio.channel_count,
+               sampleRate: audioTrack.audio.sample_rate
+             });
+           } catch(e) {
+             console.warn('Audio decoder config failed', e);
+           }
+        }
+        
+        mp4boxFile.setExtractionOptions(videoTrack.id, null, { nbSamples: 1000000 });
+        if (audioTrack && hasActualAudio) mp4boxFile.setExtractionOptions(audioTrack.id, null, { nbSamples: 1000000 });
         mp4boxFile.start();
       };
       
       mp4boxFile.onSamples = (id, user, samples) => {
-        if (decoderError || encoderError) return;
-        if (id === vTrackId && videoDecoder) {
+        if (decoderError || encoderError || !muxer) return;
+        if (id === videoTrackId) {
           for (const sample of samples) {
             try {
               const chunk = new EncodedVideoChunk({
@@ -711,7 +722,7 @@ self.onmessage = async (e) => {
               videoDecoder.decode(chunk);
             } catch(e) { decoderError = e; break; }
           }
-        } else if (id === aTrackId && audioDecoder) {
+        } else if (hasActualAudio && id === audioTrackId && audioDecoder) {
           for (const sample of samples) {
             try {
               const chunk = new EncodedAudioChunk({
@@ -726,7 +737,7 @@ self.onmessage = async (e) => {
         }
       };
       
-      mp4boxFile.onError = (e) => { throw new Error('MP4Box error: ' + e); };
+      mp4boxFile.onError = (e) => { decoderError = e; };
       
       const response = await fetch(fileUrl);
       if (!response.body) throw new Error('No response body');
@@ -746,9 +757,9 @@ self.onmessage = async (e) => {
         offset += value.byteLength;
         
         let waitCount = 0;
-        while (videoDecoder && (videoDecoder.decodeQueueSize > 15 || (videoEncoder && videoEncoder.encodeQueueSize > 15))) {
+        while (videoDecoder.decodeQueueSize > 15 || videoEncoder.encodeQueueSize > 15) {
           if (decoderError || encoderError) throw new Error('Codec error during wait');
-          if (videoDecoder.state === 'error' || (videoEncoder && videoEncoder.state === 'error')) throw new Error('Codec entered error state');
+          if (videoDecoder.state === 'error' || videoEncoder.state === 'error') throw new Error('Codec entered error state');
           await new Promise(r => setTimeout(r, 5));
           waitCount++;
           if (waitCount > 1000) throw new Error('Timeout waiting for codec queue to drain');
@@ -757,15 +768,15 @@ self.onmessage = async (e) => {
       mp4boxFile.flush();
       
       let flushWait = 0;
-      while (videoDecoder && (videoDecoder.decodeQueueSize > 0 || videoDecoder.state === 'configured')) {
+      while (videoDecoder.decodeQueueSize > 0 || videoDecoder.state === 'configured') {
         if (decoderError || encoderError) break;
         if (videoDecoder.state === 'error') break;
         await new Promise(r => setTimeout(r, 10));
         flushWait++;
         if (flushWait > 500) break;
       }
-      try { if (videoDecoder) await videoDecoder.flush(); } catch(e) {}
-      try { if (videoDecoder) videoDecoder.close(); } catch(e) {}
+      try { await videoDecoder.flush(); } catch(e) {}
+      try { videoDecoder.close(); } catch(e) {}
       
       if (audioDecoder) {
         try { await audioDecoder.flush(); } catch(e) {}
@@ -773,15 +784,15 @@ self.onmessage = async (e) => {
       }
       
       let encWait = 0;
-      while (videoEncoder && (videoEncoder.encodeQueueSize > 0 || videoEncoder.state === 'configured')) {
+      while (videoEncoder.encodeQueueSize > 0 || videoEncoder.state === 'configured') {
         if (encoderError) break;
         if (videoEncoder.state === 'error') break;
         await new Promise(r => setTimeout(r, 10));
         encWait++;
         if (encWait > 500) break;
       }
-      try { if (videoEncoder) await videoEncoder.flush(); } catch(e) {}
-      try { if (videoEncoder) videoEncoder.close(); } catch(e) {}
+      try { await videoEncoder.flush(); } catch(e) {}
+      try { videoEncoder.close(); } catch(e) {}
       
       if (audioEncoder) {
         try { await audioEncoder.flush(); } catch(e) {}
@@ -791,7 +802,7 @@ self.onmessage = async (e) => {
       if (muxer) await muxer.finalize();
       
       const bufferOut = target.buffer;
-      self.postMessage({ type: 'done', id, buffer: bufferOut }, [bufferOut]);
+      self.postMessage({ type: 'done', id, buffer: bufferOut, hasAudio: hasActualAudio }, [bufferOut]);
       
     } catch (err) {
       self.postMessage({ type: 'error', id, msg: err.message || String(err) });
@@ -854,7 +865,7 @@ function getFFmpeg() {
 
 async function toBlobURL(url, mimeType) {
   const response = await fetch(url);
-  if (!response.ok) throw new Error(`Failed to fetch: ${url}`);
+  if (!response.ok) throw new Error(\`Failed to fetch: \${url}\`);
   const blob = await response.blob();
   return URL.createObjectURL(new Blob([blob], { type: mimeType }));
 }
@@ -1021,9 +1032,9 @@ async function loadFFmpeg() {
   try {
     statusEl.textContent = 'Loading FFmpeg (Multi-Threaded)...';
     await ffmpegInstance.load({
-      coreURL: await toBlobURL(`${mtBaseURL}/ffmpeg-core.js`, 'text/javascript'),
-      wasmURL: await toBlobURL(`${mtBaseURL}/ffmpeg-core.wasm`, 'application/wasm'),
-      workerURL: await toBlobURL(`${mtBaseURL}/ffmpeg-core.worker.js`, 'text/javascript'),
+      coreURL: await toBlobURL(\`\${mtBaseURL}/ffmpeg-core.js\`, 'text/javascript'),
+      wasmURL: await toBlobURL(\`\${mtBaseURL}/ffmpeg-core.wasm\`, 'application/wasm'),
+      workerURL: await toBlobURL(\`\${mtBaseURL}/ffmpeg-core.worker.js\`, 'text/javascript'),
       classWorkerURL
     });
     
@@ -1041,8 +1052,8 @@ async function loadFFmpeg() {
   try {
     statusEl.textContent = 'Loading FFmpeg (Single-Threaded)...';
     await ffmpegInstance.load({
-      coreURL: await toBlobURL(`${stBaseURL}/ffmpeg-core.js`, 'text/javascript'),
-      wasmURL: await toBlobURL(`${stBaseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+      coreURL: await toBlobURL(\`\${stBaseURL}/ffmpeg-core.js\`, 'text/javascript'),
+      wasmURL: await toBlobURL(\`\${stBaseURL}/ffmpeg-core.wasm\`, 'application/wasm'),
       classWorkerURL
     });
     
@@ -1063,7 +1074,7 @@ function showPage(pageName) {
   const target = document.getElementById('page-' + pageName);
   if (target) target.classList.add('active');
   document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
-  document.querySelectorAll(`[data-page="${pageName}"]`).forEach(l => l.classList.add('active'));
+  document.querySelectorAll(\`[data-page="\${pageName}"]\`).forEach(l => l.classList.add('active'));
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
@@ -1093,7 +1104,7 @@ function handleContact(e) {
   const email = document.getElementById('contactEmail').value;
   const subject = document.getElementById('contactSubject').value;
   const message = document.getElementById('contactMessage').value;
-  const mailto = `mailto:veknipezeg@gmail.com?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent('Name: ' + name + '\nEmail: ' + email + '\n\n' + message)}`;
+  const mailto = \`mailto:veknipezeg@gmail.com?subject=\${encodeURIComponent(subject)}&body=\${encodeURIComponent('Name: ' + name + '\nEmail: ' + email + '\n\n' + message)}\`;
   window.location.href = mailto;
   return false;
 }
@@ -1110,21 +1121,21 @@ function renderList() {
   fileList.innerHTML = '';
   files.forEach((file, i) => {
     const li = document.createElement('li');
-    li.innerHTML = `
-      <span class="num">${i + 1}</span>
-      <span class="name" title="${file.name}">${file.name}</span>
-      <span class="size">${formatSize(file.size)}</span>
-      <button data-action="up" data-idx="${i}" ${i === 0 ? 'disabled' : ''}>Up</button>
-      <button data-action="down" data-idx="${i}" ${i === files.length - 1 ? 'disabled' : ''}>Down</button>
-      <button data-action="remove" data-idx="${i}">Remove</button>
-    `;
+    li.innerHTML = \`
+      <span class="num">\${i + 1}</span>
+      <span class="name" title="\${file.name}">\${file.name}</span>
+      <span class="size">\${formatSize(file.size)}</span>
+      <button data-action="up" data-idx="\${i}" \${i === 0 ? 'disabled' : ''}>Up</button>
+      <button data-action="down" data-idx="\${i}" \${i === files.length - 1 ? 'disabled' : ''}>Down</button>
+      <button data-action="remove" data-idx="\${i}">Remove</button>
+    \`;
     fileList.appendChild(li);
   });
 
   mergeBtn.disabled = files.length < 2;
   counter.textContent = files.length === 0
     ? 'No videos selected'
-    : `${files.length} video${files.length > 1 ? 's' : ''} selected (${formatSize(files.reduce((a, b) => a + b.size, 0))})`;
+    : \`\${files.length} video\${files.length > 1 ? 's' : ''} selected (\${formatSize(files.reduce((a, b) => a + b.size, 0))})\`;
 }
 
 function handleFiles(newFiles) {
@@ -1276,14 +1287,14 @@ async function fastFFmpegTSConcat(filesList, trackInfos, updateProgress) {
   
   let tsFiles = [];
   for (let i = 0; i < filesList.length; i++) {
-    const tsName = `part_${i}.ts`;
-    if (updateProgress) updateProgress(0.40 + ((i) / filesList.length) * 0.30, `TS remux ${i + 1}/${filesList.length}`);
+    const tsName = \`part_\${i}.ts\`;
+    if (updateProgress) updateProgress(0.40 + ((i) / filesList.length) * 0.30, \`TS remux \${i + 1}/\${filesList.length}\`);
     let code = await ffmpegInstance.exec([
       '-fflags', '+genpts',
-      '-i', `${mountDir}/${filesList[i].name}`,
+      '-i', \`\${mountDir}/\${filesList[i].name}\`,
       '-c', 'copy', '-f', 'mpegts', '-y', tsName
     ]);
-    if (code !== 0) throw new Error(`TS remux failed for ${filesList[i].name}`);
+    if (code !== 0) throw new Error(\`TS remux failed for \${filesList[i].name}\`);
     tsFiles.push(tsName);
   }
   
@@ -1308,60 +1319,14 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
   await loadFFmpeg();
   const ffmpegInstance = getFFmpeg();
   
-  // 1. Normalize non-MP4 files to MP4 sequentially (fast, just container change)
-  const mp4Files = [];
-  for (let i = 0; i < filesList.length; i++) {
-    updateProgress((i / filesList.length) * 0.1, `Normalizing container ${i+1}/${filesList.length}`);
-    const file = filesList[i];
-    if (!file.name.match(/\.mp4$|\.mov$|\.m4v$/i)) {
-       try {
-         const mountDir = `/remux_${i}`;
-         await ffmpegInstance.createDir(mountDir).catch(()=>{});
-         await ffmpegInstance.mount('WORKERFS', { files: [file] }, mountDir);
-         const outName = `remux_${i}.mp4`;
-         let code = await ffmpegInstance.exec([
-           '-fflags', '+genpts',
-           '-i', `${mountDir}/${file.name}`,
-           '-c', 'copy', '-f', 'mp4', '-movflags', '+faststart', '-y', outName
-         ]);
-         if (code === 0) {
-            const data = await ffmpegInstance.readFile(outName);
-            const blob = new Blob([data.buffer], { type: 'video/mp4' });
-            mp4Files.push(new File([blob], `remuxed_${i}.mp4`, { type: 'video/mp4' }));
-            await ffmpegInstance.deleteFile(outName).catch(()=>{});
-         } else {
-            // Fallback to re-encode if copy fails
-            code = await ffmpegInstance.exec([
-              '-fflags', '+genpts',
-              '-i', `${mountDir}/${file.name}`,
-              '-vf', `scale=${outWidth}:${outHeight}:force_original_aspect_ratio=decrease,pad=${outWidth}:${outHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${isAndroid?24:30}`,
-              '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', '-pix_fmt', 'yuv420p',
-              '-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k',
-              '-f', 'mp4', '-movflags', '+faststart', '-y', outName
-            ]);
-            const data = await ffmpegInstance.readFile(outName);
-            const blob = new Blob([data.buffer], { type: 'video/mp4' });
-            mp4Files.push(new File([blob], `remuxed_${i}.mp4`, { type: 'video/mp4' }));
-            await ffmpegInstance.deleteFile(outName).catch(()=>{});
-         }
-         await ffmpegInstance.unmount(mountDir).catch(()=>{});
-         await ffmpegInstance.deleteDir(mountDir).catch(()=>{});
-       } catch(e) {
-         mp4Files.push(file); // push original if remux fails completely
-       }
-    } else {
-       mp4Files.push(file);
-    }
-  }
-  
-  // 2. Parallel WebCodecs Pool
+  // 1. Parallel WebCodecs Pool (Directly processes original files without prior normalization)
   const targetFPS = isAndroid ? 24 : 30;
   const targetBitrate = isAndroid ? 2_500_000 : 5_000_000;
   
-  const results = new Array(mp4Files.length);
+  const results = new Array(filesList.length);
   let nextFileIdx = 0;
   let activeTasks = 0;
-  const MAX_ACTIVE = 3; // User requested max 3 at a time
+  const MAX_ACTIVE = 3; 
   
   const workerBlob = new Blob([webCodecsWorkerCode], { type: 'text/javascript' });
   const workerUrl = URL.createObjectURL(workerBlob);
@@ -1372,33 +1337,36 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
     let finishedTasks = 0;
     
     const startNext = () => {
-       while (activeTasks < MAX_ACTIVE && nextFileIdx < mp4Files.length) {
+       while (activeTasks < MAX_ACTIVE && nextFileIdx < filesList.length) {
          const idx = nextFileIdx++;
-         const file = mp4Files[idx];
+         const file = filesList[idx];
          const fileUrl = URL.createObjectURL(file);
          activeTasks++;
+         
+         // Fetch track info in background for fallback logic only
+         const trackInfoPromise = getTrackInfo(file);
          
          const worker = workers[idx % MAX_ACTIVE]; 
          const timeoutId = setTimeout(() => {
             worker.terminate();
             workers[idx % MAX_ACTIVE] = new Worker(workerUrl);
-            processFallback(idx, file, fileUrl, timeoutId); 
+            processFallback(idx, file, trackInfoPromise, fileUrl, timeoutId); 
          }, 180000); 
          
          const onMessage = (e) => {
            if (e.data.id !== idx) return; 
            if (e.data.type === 'done') {
              clearTimeout(timeoutId);
-             results[idx] = { type: 'mp4', buffer: e.data.buffer };
+             results[idx] = { type: 'mp4', buffer: e.data.buffer, hasAudio: e.data.hasAudio };
              URL.revokeObjectURL(fileUrl);
              finishedTasks++;
              activeTasks--;
-             updateProgress(0.2 + (finishedTasks / mp4Files.length) * 0.6, `Parallel encoding: ${finishedTasks}/${mp4Files.length} done`);
-             if (finishedTasks === mp4Files.length) resolve();
+             updateProgress(0.2 + (finishedTasks / filesList.length) * 0.6, \`Parallel encoding: \${finishedTasks}/\${filesList.length} done\`);
+             if (finishedTasks === filesList.length) resolve();
              else startNext();
            } else if (e.data.type === 'error') {
              clearTimeout(timeoutId);
-             processFallback(idx, file, fileUrl, timeoutId, e.data.msg);
+             processFallback(idx, file, trackInfoPromise, fileUrl, timeoutId, e.data.msg);
            }
          };
          
@@ -1411,25 +1379,28 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
             outWidth: parseInt(outWidth),
             outHeight: parseInt(outHeight),
             targetFPS,
-            targetBitrate
+            targetBitrate,
+            hasAudio: true, // Worker determines actual presence dynamically
+            videoTrackInfo: null, 
+            audioTrackInfo: null  
          });
        }
     };
     
-    const processFallback = async (idx, file, fileUrl, timeoutId, errMsg) => {
+    const processFallback = async (idx, file, trackInfoPromise, fileUrl, timeoutId, errMsg) => {
        if (fileUrl) URL.revokeObjectURL(fileUrl);
-       if (errMsg) console.warn(`WebCodecs failed for ${idx}, falling back to FFmpeg: ${errMsg}`);
+       if (errMsg) console.warn(\`WebCodecs failed for \${idx}, falling back to FFmpeg: \${errMsg}\`);
        try {
-         // Only inspect metadata here if it fell back to FFmpeg to avoid blocking parallel pool
-         const trackInfo = await getTrackInfo(file); 
-         const mountDir = `/fallback_${idx}`;
+         const trackInfo = await trackInfoPromise;
+         const mountDir = \`/fallback_\${idx}\`;
          await ffmpegInstance.createDir(mountDir).catch(()=>{});
          await ffmpegInstance.mount('WORKERFS', { files: [file] }, mountDir);
-         const tsName = `fallback_${idx}.ts`;
-         const videoFilter = `scale=${outWidth}:${outHeight}:force_original_aspect_ratio=decrease,pad=${outWidth}:${outHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${targetFPS}`;
+         const tsName = \`fallback_\${idx}.ts\`;
+         const videoFilter = \`scale=\${outWidth}:\${outHeight}:force_original_aspect_ratio=decrease,pad=\${outWidth}:\${outHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=\${targetFPS}\`;
+         
          let args = [
            '-fflags', '+genpts',
-           '-i', `${mountDir}/${file.name}`,
+           '-i', \`\${mountDir}/\${file.name}\`,
            '-vf', videoFilter,
            '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-crf', '28', '-pix_fmt', 'yuv420p'
          ];
@@ -1438,15 +1409,31 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
            args.push('-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k');
            args.push('-map', '0:v:0', '-map', '0:a:0');
          } else {
-           const duration = trackInfo.duration || 10;
-           args.push('-f', 'lavfi', '-i', `anullsrc=r=44100:cl=stereo`);
+           const duration = trackInfo.duration || 3600;
+           args.push('-f', 'lavfi', '-i', \`anullsrc=r=44100:cl=stereo\`);
            args.push('-t', duration.toString());
            args.push('-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k');
            args.push('-map', '0:v:0', '-map', '1:a:0');
          }
-         args.push('-f', 'mpegts', '-y', tsName);
+         args.push('-shortest', '-f', 'mpegts', '-y', tsName);
          
          let code = await ffmpegInstance.exec(args);
+         
+         if (code !== 0 && trackInfo.hasAudio) {
+             const retryArgs = [
+               '-fflags', '+genpts',
+               '-i', \`\${mountDir}/\${file.name}\`,
+               '-f', 'lavfi', '-i', \`anullsrc=r=44100:cl=stereo\`,
+               '-vf', videoFilter,
+               '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-crf', '28', '-pix_fmt', 'yuv420p',
+               '-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k',
+               '-t', '3600', 
+               '-map', '0:v:0', '-map', '1:a:0',
+               '-shortest', '-f', 'mpegts', '-y', tsName
+             ];
+             code = await ffmpegInstance.exec(retryArgs);
+         }
+         
          if (code !== 0) throw new Error('FFmpeg fallback failed');
          
          const data = await ffmpegInstance.readFile(tsName);
@@ -1457,8 +1444,8 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
          
          finishedTasks++;
          activeTasks--;
-         updateProgress(0.2 + (finishedTasks / mp4Files.length) * 0.6, `Parallel encoding: ${finishedTasks}/${mp4Files.length} done`);
-         if (finishedTasks === mp4Files.length) resolve();
+         updateProgress(0.2 + (finishedTasks / filesList.length) * 0.6, \`Parallel encoding: \${finishedTasks}/\${filesList.length} done\`);
+         if (finishedTasks === filesList.length) resolve();
          else startNext();
        } catch(e) {
          clearTimeout(timeoutId);
@@ -1472,25 +1459,40 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
   workers.forEach(w => { try { w.terminate(); } catch(e){} });
   URL.revokeObjectURL(workerUrl);
   
-  // 4. Final Concat
+  // 2. Final Concat
   updateProgress(0.8, 'Concatenating all segments...');
   
   let tsFiles = [];
   for (let i = 0; i < results.length; i++) {
     const part = results[i];
-    const mp4Name = `part_${i}.mp4`;
-    const tsName = `part_${i}.ts`;
+    const mp4Name = \`part_\${i}.mp4\`;
+    const tsName = \`part_\${i}.ts\`;
     
     if (part.type === 'ts') {
       await ffmpegInstance.writeFile(tsName, new Uint8Array(part.buffer));
     } else {
       await ffmpegInstance.writeFile(mp4Name, new Uint8Array(part.buffer));
-      let code = await ffmpegInstance.exec([
-        '-fflags', '+genpts',
-        '-i', mp4Name,
-        '-c', 'copy', '-f', 'mpegts', '-y', tsName
-      ]);
-      if (code !== 0) throw new Error(`TS remux failed for segment ${i}`);
+      
+      let code = 0;
+      if (part.hasAudio) {
+         code = await ffmpegInstance.exec([
+           '-fflags', '+genpts',
+           '-i', mp4Name,
+           '-c', 'copy', '-f', 'mpegts', '-y', tsName
+         ]);
+      } else {
+         code = await ffmpegInstance.exec([
+           '-fflags', '+genpts',
+           '-i', mp4Name,
+           '-f', 'lavfi', '-i', \`anullsrc=r=44100:cl=stereo\`,
+           '-map', '0:v:0', '-map', '1:a:0',
+           '-c:v', 'copy', '-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k',
+           '-t', '3600', 
+           '-shortest', '-f', 'mpegts', '-y', tsName
+         ]);
+      }
+      
+      if (code !== 0) throw new Error(\`TS remux failed for segment \${i}\`);
       await ffmpegInstance.deleteFile(mp4Name).catch(()=>{});
     }
     tsFiles.push(tsName);
@@ -1585,7 +1587,7 @@ mergeBtn.addEventListener('click', async () => {
          let nextAudioTs = 0;
          
          for (let fileIdx = 0; fileIdx < files.length; fileIdx++) {
-           updateProgress(0.1 + ((fileIdx + 0.5) / files.length) * 0.8, `Instant remuxing stream copy ${fileIdx + 1}/${files.length}`);
+           updateProgress(0.1 + ((fileIdx + 0.5) / files.length) * 0.8, \`Instant remuxing stream copy \${fileIdx + 1}/\${files.length}\`);
            const buffer = await readFileSlice(files[fileIdx], 0, files[fileIdx].size);
            
            await new Promise((resolve, reject) => {
@@ -1662,7 +1664,7 @@ mergeBtn.addEventListener('click', async () => {
          updateProgress(1.0, 'Instant merge completed without re-encoding!');
        } catch(e) {
          logEl.style.display = 'block';
-         logEl.textContent += `Instant merge failed: ${e.message}\n`;
+         logEl.textContent += \`Instant merge failed: \${e.message}\n\`;
          finalBlob = null;
        }
     }
@@ -1679,7 +1681,7 @@ mergeBtn.addEventListener('click', async () => {
          }
       } catch(e) {
          logEl.style.display = 'block';
-         logEl.textContent += `Fast TS copy failed: ${e.message}\n`;
+         logEl.textContent += \`Fast TS copy failed: \${e.message}\n\`;
       }
     }
     
@@ -1690,10 +1692,10 @@ mergeBtn.addEventListener('click', async () => {
     
     outputBlobUrl = URL.createObjectURL(finalBlob);
     download.href = outputBlobUrl;
-    download.download = `merged_final_${Date.now()}.mp4`;
+    download.download = \`merged_final_\${Date.now()}.mp4\`;
     download.style.display = 'inline-block';
     progress.value = 100;
-    statusEl.textContent = `Merge complete! Final video size: ${formatSize(finalBlob.size)}`;
+    statusEl.textContent = \`Merge complete! Final video size: \${formatSize(finalBlob.size)}\`;
 
   } catch (err) {
     statusEl.textContent = 'Error: ' + err.message;
