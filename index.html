@@ -1311,13 +1311,16 @@ async function fastFFmpegTSConcat(filesList, trackInfos, updateProgress) {
   await loadFFmpeg();
   const ffmpegInstance = getFFmpeg();
   
+  // FIX: Added UI update right after loading to prevent it from "freezing" on "FFmpeg ready"
+  if (updateProgress) updateProgress(0.12, 'FFmpeg loaded. Preparing fast TS concat...');
+
   let tsFiles = [];
   for (let i = 0; i < filesList.length; i++) {
     const file = filesList[i];
     const safeName = file.name.replace(/[^a-z0-9.]/gi, '_').substring(0, 50);
     const filePath = `/input_${i}_${safeName}`;
     
-    if (updateProgress) updateProgress(0.10 + (i / filesList.length) * 0.30, `Loading file ${i + 1}/${filesList.length} into memory...`);
+    if (updateProgress) updateProgress(0.15 + (i / filesList.length) * 0.25, `Loading file ${i + 1}/${filesList.length} into memory...`);
     await ffmpegInstance.writeFile(filePath, new Uint8Array(await file.arrayBuffer()));
 
     const tsName = `part_${i}.ts`;
@@ -1353,6 +1356,9 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
   await loadFFmpeg();
   const ffmpegInstance = getFFmpeg();
   
+  // FIX: Added UI update right after loading
+  updateProgress(0.15, 'FFmpeg loaded. Initializing parallel workers...');
+
   const targetFPS = isAndroid ? 24 : 30;
   const targetBitrate = isAndroid ? 2_500_000 : 5_000_000;
   
@@ -1374,6 +1380,8 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
        if (fileUrl) URL.revokeObjectURL(fileUrl);
        if (errMsg) console.warn(`WebCodecs failed for ${idx}, falling back to FFmpeg: ${errMsg}`);
        try {
+         // FIX: Added UI update so user sees fallback is starting
+         updateProgress(0.2 + (idx / filesList.length) * 0.5, `Fallback encoding file ${idx + 1}...`);
          const safeName = file.name.replace(/[^a-z0-9.]/gi, '_').substring(0, 50);
          const filePath = `/fallback_input_${idx}_${safeName}`;
          await ffmpegInstance.writeFile(filePath, new Uint8Array(await file.arrayBuffer()));
@@ -1439,6 +1447,10 @@ async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) 
        while (activeTasks < MAX_ACTIVE && nextFileIdx < filesList.length) {
          const idx = nextFileIdx++;
          const file = filesList[idx];
+         
+         // FIX: Added UI update for each worker initialization
+         updateProgress(0.15 + (idx / filesList.length) * 0.05, `Processing file ${idx + 1}/${filesList.length}...`);
+         
          const fileUrl = URL.createObjectURL(file);
          activeTasks++;
          
