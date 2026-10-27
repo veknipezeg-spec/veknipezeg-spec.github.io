@@ -1,13 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8"><!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0"><!DOCTYPE html>
-<html lang="en">
-<head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Universal Video Merger - Free Online Tool to Combine Videos</title>
@@ -730,7 +723,6 @@ self.onmessage = async (e) => {
         const { done, value } = await reader.read();
         if (done) { reading = false; break; }
         
-        // mp4box strictly expects an ArrayBuffer
         const buffer = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
         buffer.fileStart = offset;
         mp4boxFile.appendBuffer(buffer);
@@ -1257,58 +1249,6 @@ async function getTrackInfo(file) {
   }
 }
 
-async function remuxNonMP4Files(filesList, updateProgress) {
-  const finalList = [...filesList];
-  const nonMP4Indices = [];
-  filesList.forEach((f, i) => {
-    if (!f.name.match(/\.mp4$|\.mov$|\.m4v$/i)) nonMP4Indices.push(i);
-  });
-  
-  if (nonMP4Indices.length === 0) return finalList;
-  
-  await loadFFmpeg();
-  const ffmpegInstance = getFFmpeg();
-  
-  for (let i = 0; i < nonMP4Indices.length; i++) {
-    const idx = nonMP4Indices[i];
-    const file = finalList[idx];
-    const mountDir = `/remux_mnt_${i}`;
-    try { await ffmpegInstance.createDir(mountDir); } catch(e) {}
-    await ffmpegInstance.mount('WORKERFS', { files: [file] }, mountDir);
-    
-    if (updateProgress) updateProgress((i / nonMP4Indices.length) * 0.15, `Remuxing container ${i + 1}/${nonMP4Indices.length}`);
-    
-    const outputName = `remuxed_${i}.mp4`;
-    let code = await ffmpegInstance.exec([
-      '-i', `${mountDir}/${file.name}`,
-      '-c', 'copy', '-f', 'mp4', '-movflags', '+faststart', '-y', outputName
-    ]);
-    
-    if (code !== 0 && file.name.match(/\.webm$|\.mkv$/i)) {
-      const webmOutput = `remuxed_${i}.webm`;
-      code = await ffmpegInstance.exec([
-        '-i', `${mountDir}/${file.name}`,
-        '-c', 'copy', '-f', 'webm', '-y', webmOutput
-      ]);
-      if (code === 0) {
-        const data = await ffmpegInstance.readFile(webmOutput);
-        const blob = new Blob([data.buffer], { type: 'video/webm' });
-        finalList[idx] = new File([blob], `remuxed_${i}.webm`, { type: 'video/webm' });
-        try { await ffmpegInstance.deleteFile(webmOutput); } catch(e) {}
-      }
-    } else if (code === 0) {
-      const data = await ffmpegInstance.readFile(outputName);
-      const blob = new Blob([data.buffer], { type: 'video/mp4' });
-      finalList[idx] = new File([blob], `remuxed_${i}.mp4`, { type: 'video/mp4' });
-      try { await ffmpegInstance.deleteFile(outputName); } catch(e) {}
-    }
-    
-    await ffmpegInstance.unmount(mountDir).catch(() => {});
-    await ffmpegInstance.deleteDir(mountDir).catch(() => {});
-  }
-  return finalList;
-}
-
 async function fastFFmpegTSConcat(filesList, trackInfos, updateProgress) {
   await loadFFmpeg();
   const ffmpegInstance = getFFmpeg();
@@ -1347,60 +1287,113 @@ async function fastFFmpegTSConcat(filesList, trackInfos, updateProgress) {
   return new Blob([data.buffer], { type: 'video/mp4' });
 }
 
-async function processWithWorkerPool(filesList, trackInfos, outWidth, outHeight, updateProgress) {
+async function parallelPipeline(filesList, outWidth, outHeight, updateProgress) {
+  await loadFFmpeg();
+  const ffmpegInstance = getFFmpeg();
+  
+  // 1. Normalize non-MP4 files to MP4 sequentially (fast, just container change)
+  const mp4Files = [];
+  for (let i = 0; i < filesList.length; i++) {
+    updateProgress((i / filesList.length) * 0.1, `Normalizing container ${i+1}/${filesList.length}`);
+    const file = filesList[i];
+    if (!file.name.match(/\.mp4$|\.mov$|\.m4v$/i)) {
+       try {
+         const mountDir = `/remux_${i}`;
+         await ffmpegInstance.createDir(mountDir).catch(()=>{});
+         await ffmpegInstance.mount('WORKERFS', { files: [file] }, mountDir);
+         const outName = `remux_${i}.mp4`;
+         let code = await ffmpegInstance.exec([
+           '-fflags', '+genpts',
+           '-i', `${mountDir}/${file.name}`,
+           '-c', 'copy', '-f', 'mp4', '-movflags', '+faststart', '-y', outName
+         ]);
+         if (code === 0) {
+            const data = await ffmpegInstance.readFile(outName);
+            const blob = new Blob([data.buffer], { type: 'video/mp4' });
+            mp4Files.push(new File([blob], `remuxed_${i}.mp4`, { type: 'video/mp4' }));
+            await ffmpegInstance.deleteFile(outName).catch(()=>{});
+         } else {
+            // Fallback to re-encode if copy fails
+            code = await ffmpegInstance.exec([
+              '-fflags', '+genpts',
+              '-i', `${mountDir}/${file.name}`,
+              '-vf', `scale=${outWidth}:${outHeight}:force_original_aspect_ratio=decrease,pad=${outWidth}:${outHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${isAndroid?24:30}`,
+              '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', '-pix_fmt', 'yuv420p',
+              '-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k',
+              '-f', 'mp4', '-movflags', '+faststart', '-y', outName
+            ]);
+            const data = await ffmpegInstance.readFile(outName);
+            const blob = new Blob([data.buffer], { type: 'video/mp4' });
+            mp4Files.push(new File([blob], `remuxed_${i}.mp4`, { type: 'video/mp4' }));
+            await ffmpegInstance.deleteFile(outName).catch(()=>{});
+         }
+         await ffmpegInstance.unmount(mountDir).catch(()=>{});
+         await ffmpegInstance.deleteDir(mountDir).catch(()=>{});
+       } catch(e) {
+         mp4Files.push(file); // push original if remux fails completely
+       }
+    } else {
+       mp4Files.push(file);
+    }
+  }
+  
+  // 2. Track Info for WebCodecs
+  updateProgress(0.1, 'Inspecting metadata...');
+  const trackInfos = await Promise.all(mp4Files.map(f => getTrackInfo(f)));
+  
+  // 3. Parallel WebCodecs Pool
   const targetFPS = isAndroid ? 24 : 30;
   const targetBitrate = isAndroid ? 2_500_000 : 5_000_000;
   
+  const results = new Array(mp4Files.length);
+  let nextFileIdx = 0;
+  let activeTasks = 0;
+  const MAX_ACTIVE = 3; // User requested max 3 at a time
+  
   const workerBlob = new Blob([webCodecsWorkerCode], { type: 'text/javascript' });
   const workerUrl = URL.createObjectURL(workerBlob);
-  
-  // Limit to max 3 concurrent workers regardless of hardware concurrency
-  const MAX_WORKERS = Math.min(filesList.length, 3);
   const workers = [];
-  for (let i = 0; i < MAX_WORKERS; i++) {
-    workers.push(new Worker(workerUrl));
-  }
+  for(let i=0; i<MAX_ACTIVE; i++) workers.push(new Worker(workerUrl));
   
-  return new Promise(async (resolve, reject) => {
-    const results = new Array(filesList.length);
-    let completed = 0;
-    let nextFileIdx = 0;
+  await new Promise((resolve, reject) => {
+    let finishedTasks = 0;
     
-    const runWorker = (worker) => {
-      return new Promise((resolveWorker, rejectWorker) => {
-        const processNext = () => {
-          if (nextFileIdx >= filesList.length) {
-            resolveWorker();
-            return;
-          }
-          
-          const idx = nextFileIdx++;
-          const file = filesList[idx];
-          const trackInfo = trackInfos[idx];
-          const fileUrl = URL.createObjectURL(file);
-          
-          // Add timeout to prevent infinite hanging if worker dies silently
-          let timeoutId = setTimeout(() => {
+    const startNext = () => {
+       while (activeTasks < MAX_ACTIVE && nextFileIdx < mp4Files.length) {
+         const idx = nextFileIdx++;
+         const file = mp4Files[idx];
+         const trackInfo = trackInfos[idx];
+         const fileUrl = URL.createObjectURL(file);
+         activeTasks++;
+         
+         const worker = workers[idx % MAX_ACTIVE]; 
+         const timeoutId = setTimeout(() => {
+            worker.terminate();
+            workers[idx % MAX_ACTIVE] = new Worker(workerUrl);
+            processFallback(idx, file, trackInfo, fileUrl, timeoutId); 
+         }, 180000); 
+         
+         const onMessage = (e) => {
+           if (e.data.id !== idx) return; 
+           if (e.data.type === 'done') {
+             clearTimeout(timeoutId);
+             results[idx] = { type: 'mp4', buffer: e.data.buffer };
              URL.revokeObjectURL(fileUrl);
-             rejectWorker(new Error('Worker timeout processing file ' + idx));
-          }, 180000); // 3 minute timeout per file
-          
-          worker.onmessage = (e) => {
-            if (e.data.type === 'done' && e.data.id === idx) {
-              clearTimeout(timeoutId);
-              results[idx] = e.data.buffer;
-              completed++;
-              if (updateProgress) updateProgress(0.50 + (completed / filesList.length) * 0.40, `Parallel hardware encoding: ${completed}/${filesList.length} done`);
-              URL.revokeObjectURL(fileUrl);
-              processNext();
-            } else if (e.data.type === 'error' && e.data.id === idx) {
-              clearTimeout(timeoutId);
-              URL.revokeObjectURL(fileUrl);
-              rejectWorker(new Error(e.data.msg));
-            }
-          };
-          
-          worker.postMessage({
+             finishedTasks++;
+             activeTasks--;
+             updateProgress(0.2 + (finishedTasks / mp4Files.length) * 0.6, `Parallel encoding: ${finishedTasks}/${mp4Files.length} done`);
+             if (finishedTasks === mp4Files.length) resolve();
+             else startNext();
+           } else if (e.data.type === 'error') {
+             clearTimeout(timeoutId);
+             // processFallback handles revoking fileUrl
+             processFallback(idx, file, trackInfo, fileUrl, timeoutId, e.data.msg);
+           }
+         };
+         
+         worker.onmessage = onMessage;
+         
+         worker.postMessage({
             type: 'process',
             id: idx,
             fileUrl,
@@ -1411,308 +1404,101 @@ async function processWithWorkerPool(filesList, trackInfos, outWidth, outHeight,
             hasAudio: trackInfo.hasAudio,
             videoTrackInfo: trackInfo.videoTrack,
             audioTrackInfo: trackInfo.audioTrack
-          });
-        };
-        processNext();
-      });
+         });
+       }
     };
     
-    try {
-      await Promise.all(workers.map(w => runWorker(w)));
-      workers.forEach(w => w.terminate());
-      URL.revokeObjectURL(workerUrl);
-      resolve(results);
-    } catch (err) {
-      workers.forEach(w => w.terminate());
-      URL.revokeObjectURL(workerUrl);
-      reject(err);
-    }
+    const processFallback = async (idx, file, trackInfo, fileUrl, timeoutId, errMsg) => {
+       if (fileUrl) URL.revokeObjectURL(fileUrl);
+       if (errMsg) console.warn(`WebCodecs failed for ${idx}, falling back to FFmpeg: ${errMsg}`);
+       try {
+         const mountDir = `/fallback_${idx}`;
+         await ffmpegInstance.createDir(mountDir).catch(()=>{});
+         await ffmpegInstance.mount('WORKERFS', { files: [file] }, mountDir);
+         const tsName = `fallback_${idx}.ts`;
+         const videoFilter = `scale=${outWidth}:${outHeight}:force_original_aspect_ratio=decrease,pad=${outWidth}:${outHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${targetFPS}`;
+         let args = [
+           '-fflags', '+genpts',
+           '-i', `${mountDir}/${file.name}`,
+           '-vf', videoFilter,
+           '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-crf', '28', '-pix_fmt', 'yuv420p'
+         ];
+         if (trackInfo.hasAudio) {
+           args.push('-af', 'aresample=44100,aformat=channel_layouts=stereo');
+           args.push('-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k');
+           args.push('-map', '0:v:0', '-map', '0:a:0');
+         } else {
+           const duration = trackInfo.duration || 10;
+           args.push('-f', 'lavfi', '-i', `anullsrc=r=44100:cl=stereo`);
+           args.push('-t', duration.toString());
+           args.push('-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k');
+           args.push('-map', '0:v:0', '-map', '1:a:0');
+         }
+         args.push('-f', 'mpegts', '-y', tsName);
+         
+         let code = await ffmpegInstance.exec(args);
+         if (code !== 0) throw new Error('FFmpeg fallback failed');
+         
+         const data = await ffmpegInstance.readFile(tsName);
+         results[idx] = { type: 'ts', buffer: data.buffer };
+         await ffmpegInstance.deleteFile(tsName).catch(()=>{});
+         await ffmpegInstance.unmount(mountDir).catch(()=>{});
+         await ffmpegInstance.deleteDir(mountDir).catch(()=>{});
+         
+         finishedTasks++;
+         activeTasks--;
+         updateProgress(0.2 + (finishedTasks / mp4Files.length) * 0.6, `Parallel encoding: ${finishedTasks}/${mp4Files.length} done`);
+         if (finishedTasks === mp4Files.length) resolve();
+         else startNext();
+       } catch(e) {
+         clearTimeout(timeoutId);
+         reject(e);
+       }
+    };
+    
+    startNext();
   });
-}
-
-async function finalConcatTS(results, updateProgress) {
-  await loadFFmpeg();
-  const ffmpegInstance = getFFmpeg();
-  if (updateProgress) updateProgress(0.90, 'Finalizing hardware encode with TS concat...');
+  
+  workers.forEach(w => { try { w.terminate(); } catch(e){} });
+  URL.revokeObjectURL(workerUrl);
+  
+  // 4. Final Concat
+  updateProgress(0.8, 'Concatenating all segments...');
   
   let tsFiles = [];
   for (let i = 0; i < results.length; i++) {
+    const part = results[i];
     const mp4Name = `part_${i}.mp4`;
     const tsName = `part_${i}.ts`;
-    await ffmpegInstance.writeFile(mp4Name, new Uint8Array(results[i]));
-    let code = await ffmpegInstance.exec([
-      '-fflags', '+genpts',
-      '-i', mp4Name,
-      '-c', 'copy', '-f', 'mpegts', '-y', tsName
-    ]);
-    if (code !== 0) throw new Error(`TS remux failed for worker output ${i}`);
-    tsFiles.push(tsName);
-    // Delete the intermediate MP4 immediately to free memory
-    try { await ffmpegInstance.deleteFile(mp4Name); } catch(e) {}
-  }
-  
-  if (updateProgress) updateProgress(0.95, 'Concatenating TS streams...');
-  const concatStr = 'concat:' + tsFiles.join('|');
-  const code = await ffmpegInstance.exec([
-    '-i', concatStr,
-    '-c', 'copy', '-movflags', '+faststart', '-y', 'final.mp4'
-  ]);
-  
-  for (const ts of tsFiles) ffmpegInstance.deleteFile(ts).catch(()=>{});
-  
-  if (code !== 0) throw new Error('Final TS concat failed');
-  
-  const data = await ffmpegInstance.readFile('final.mp4');
-  return new Blob([data.buffer], { type: 'video/mp4' });
-}
-
-async function fastSequentialReencode(filesList, trackInfos, outWidth, outHeight, updateProgress) {
-  await loadFFmpeg();
-  const ffmpegInstance = getFFmpeg();
-  
-  const mountDir = '/mnt_seq_enc';
-  try { await ffmpegInstance.createDir(mountDir); } catch(e) {}
-  await ffmpegInstance.mount('WORKERFS', { files: filesList }, mountDir);
-  
-  const fps = isAndroid ? 24 : 30;
-  let tsFiles = [];
-  
-  for (let i = 0; i < filesList.length; i++) {
-    const tsName = `enc_${i}.ts`;
-    const trackInfo = trackInfos[i];
-    if (updateProgress) updateProgress(0.70 + ((i) / filesList.length) * 0.30, `Sequential encode ${i + 1}/${filesList.length}`);
     
-    const videoFilter = `scale=${outWidth}:${outHeight}:force_original_aspect_ratio=decrease,pad=${outWidth}:${outHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${fps}`;
-    
-    let args = [
-      '-fflags', '+genpts',
-      '-i', `${mountDir}/${filesList[i].name}`,
-      '-vf', videoFilter,
-      '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-crf', '28', '-pix_fmt', 'yuv420p'
-    ];
-    
-    if (trackInfo.hasAudio) {
-      args.push('-af', 'aresample=44100,aformat=channel_layouts=stereo');
-      args.push('-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k');
-      args.push('-map', '0:v:0', '-map', '0:a:0');
+    if (part.type === 'ts') {
+      await ffmpegInstance.writeFile(tsName, new Uint8Array(part.buffer));
     } else {
-      const duration = trackInfo.duration || 10;
-      args.push('-f', 'lavfi', '-i', `anullsrc=r=44100:cl=stereo`);
-      args.push('-t', duration.toString());
-      args.push('-c:a', 'aac', '-ac', '2', '-ar', '44100', '-b:a', '96k');
-      args.push('-map', '0:v:0', '-map', '1:a:0');
+      await ffmpegInstance.writeFile(mp4Name, new Uint8Array(part.buffer));
+      let code = await ffmpegInstance.exec([
+        '-fflags', '+genpts',
+        '-i', mp4Name,
+        '-c', 'copy', '-f', 'mpegts', '-y', tsName
+      ]);
+      if (code !== 0) throw new Error(`TS remux failed for segment ${i}`);
+      await ffmpegInstance.deleteFile(mp4Name).catch(()=>{});
     }
-    
-    args.push('-f', 'mpegts', '-y', tsName);
-    
-    let code = await ffmpegInstance.exec(args);
-    if (code !== 0) throw new Error(`Sequential encode failed for file ${i}`);
     tsFiles.push(tsName);
   }
   
-  if (updateProgress) updateProgress(1.0, 'Concatenating TS streams...');
+  updateProgress(0.95, 'Finalizing video...');
   const concatStr = 'concat:' + tsFiles.join('|');
   const code = await ffmpegInstance.exec([
     '-i', concatStr,
-    '-c', 'copy', '-movflags', '+faststart', '-y', 'final_seq.mp4'
+    '-c', 'copy', '-movflags', '+faststart', '-y', 'final_pipeline.mp4'
   ]);
   
-  for (const ts of tsFiles) ffmpegInstance.deleteFile(ts).catch(()=>{});
-  await ffmpegInstance.unmount(mountDir).catch(()=>{});
-  await ffmpegInstance.deleteDir(mountDir).catch(()=>{});
+  for (const ts of tsFiles) await ffmpegInstance.deleteFile(ts).catch(()=>{});
   
-  if (code !== 0) throw new Error('Final TS concat failed');
+  if (code !== 0) throw new Error('Final concat failed');
   
-  const data = await ffmpegInstance.readFile('final_seq.mp4');
+  const data = await ffmpegInstance.readFile('final_pipeline.mp4');
   return new Blob([data.buffer], { type: 'video/mp4' });
-}
-
-async function mergeBatch(filesList, outWidth, outHeight, updateProgress) {
-  updateProgress(0, 'Pre-normalizing containers...');
-  let currentFiles = await remuxNonMP4Files(filesList, updateProgress);
-  
-  if (currentFiles.length === 1) {
-    updateProgress(1.0, 'Single file batch - skipping merge.');
-    const buffer = await readFileSlice(currentFiles[0], 0, currentFiles[0].size);
-    return new Blob([buffer], { type: currentFiles[0].type || 'video/mp4' });
-  }
-  
-  updateProgress(0.15, 'Inspecting metadata...');
-  let trackInfos = await Promise.all(currentFiles.map(f => getTrackInfo(f)));
-  
-  const hasDefinitivelyNoVideo = trackInfos.some(t => t.isMP4 && t.parsed === true && !t.hasVideo);
-  if (hasDefinitivelyNoVideo) throw new Error('One or more files have no video track');
-  
-  const firstVt = trackInfos[0].videoTrack;
-  const firstAt = trackInfos[0].audioTrack;
-  const firstHasAudio = trackInfos[0].hasAudio;
-  
-  const allMP4AndCompatible = currentFiles.every((f, idx) => {
-    const t = trackInfos[idx];
-    if (!t.isMP4 || !t.parsed || !t.hasVideo || !t.videoTrack) return false;
-    if (!firstVt || !firstVt.codec) return false;
-    
-    const isAvc = t.videoTrack.codec && t.videoTrack.codec.startsWith('avc');
-    if (!isAvc) return false;
-    if (t.videoTrack.width !== firstVt.width || t.videoTrack.height !== firstVt.height) return false;
-    
-    if (firstHasAudio) {
-      if (!t.hasAudio || !t.audioTrack) return false;
-      const isAac = t.audioTrack.codec && t.audioTrack.codec.startsWith('mp4a');
-      if (!isAac) return false;
-      if (t.audioTrack.sampleRate !== firstAt.sampleRate) return false;
-      if (t.audioTrack.channels !== firstAt.channels) return false;
-    } else {
-      if (t.hasAudio) return false;
-    }
-    
-    return true;
-  });
-  
-  if (allMP4AndCompatible && supportsWebCodecs) {
-    try {
-      updateProgress(0.20, 'Using instant stream copy (no re-encoding)...');
-      const target = new ArrayBufferTarget();
-      
-      const muxer = new Muxer({
-        target,
-        video: { codec: 'avc', width: firstVt.width, height: firstVt.height },
-        audio: firstAt ? { codec: 'aac', numberOfChannels: firstAt.channels, sampleRate: firstAt.sampleRate } : undefined,
-        fastStart: 'in-memory'
-      });
-      
-      let nextVideoTs = 0;
-      let nextAudioTs = 0;
-      
-      for (let fileIdx = 0; fileIdx < currentFiles.length; fileIdx++) {
-        updateProgress(0.20 + ((fileIdx + 0.5) / currentFiles.length) * 0.70, `Remuxing stream copy ${fileIdx + 1}/${currentFiles.length}`);
-        
-        const buffer = await readFileSlice(currentFiles[fileIdx], 0, currentFiles[fileIdx].size);
-        
-        await new Promise((resolve, reject) => {
-          const mp4boxFile = MP4Box.createFile();
-          let videoStartTs = null;
-          let audioStartTs = null;
-          let maxVideoDuration = 0;
-          let maxAudioDuration = 0;
-          let lastVideoTs = nextVideoTs - 1;
-          let lastAudioTs = nextAudioTs - 1;
-          
-          mp4boxFile.onReady = (info) => {
-            const videoTrack = info.tracks.find(t => t.type === 'video');
-            const audioTrack = info.tracks.find(t => t.type === 'audio');
-            
-            if (videoTrack) mp4boxFile.setExtractionOptions(videoTrack.id, null, { nbSamples: 1000000 });
-            if (audioTrack) mp4boxFile.setExtractionOptions(audioTrack.id, null, { nbSamples: 1000000 });
-            
-            mp4boxFile.onSamples = (id, user, samples) => {
-              if (videoTrack && id === videoTrack.id) {
-                for (const sample of samples) {
-                  let rawTs = Math.round(sample.cts * 1000000 / sample.timescale);
-                  let dur = Math.round(sample.duration * 1000000 / sample.timescale);
-                  if (videoStartTs === null) videoStartTs = rawTs;
-                  let ts = nextVideoTs + (rawTs - videoStartTs);
-                  if (ts <= lastVideoTs) ts = lastVideoTs + 1000;
-                  lastVideoTs = ts;
-                  let endTs = ts + dur;
-                  if (endTs - nextVideoTs > maxVideoDuration) maxVideoDuration = endTs - nextVideoTs;
-                  try {
-                    muxer.addVideoChunk(new EncodedVideoChunk({ 
-                      type: sample.is_sync ? 'key' : 'delta', 
-                      timestamp: ts, 
-                      duration: dur, 
-                      data: sample.data 
-                    }));
-                  } catch(e) { console.warn("Video chunk error:", e); }
-                }
-              } else if (audioTrack && id === audioTrack.id) {
-                for (const sample of samples) {
-                  let rawTs = Math.round(sample.cts * 1000000 / sample.timescale);
-                  let dur = Math.round(sample.duration * 1000000 / sample.timescale);
-                  if (audioStartTs === null) audioStartTs = rawTs;
-                  let ts = nextAudioTs + (rawTs - audioStartTs);
-                  if (ts <= lastAudioTs) ts = lastAudioTs + 1000;
-                  lastAudioTs = ts;
-                  let endTs = ts + dur;
-                  if (endTs - nextAudioTs > maxAudioDuration) maxAudioDuration = endTs - nextAudioTs;
-                  try {
-                    muxer.addAudioChunk(new EncodedAudioChunk({ 
-                      type: sample.is_sync ? 'key' : 'delta', 
-                      timestamp: ts, 
-                      duration: dur, 
-                      data: sample.data 
-                    }));
-                  } catch(e) { console.warn("Audio chunk error:", e); }
-                }
-              }
-            };
-            
-            mp4boxFile.start();
-          };
-          
-          mp4boxFile.onError = (e) => reject(e);
-          
-          buffer.fileStart = 0;
-          mp4boxFile.appendBuffer(buffer);
-          mp4boxFile.flush();
-          
-          setTimeout(() => {
-            nextVideoTs += maxVideoDuration;
-            nextAudioTs += maxAudioDuration;
-            resolve();
-          }, 50);
-        });
-      }
-      await muxer.finalize();
-      const blob = new Blob([target.buffer], { type: 'video/mp4' });
-      updateProgress(1.0, `Instant merge! Stream copied without re-encoding`);
-      return blob;
-    } catch (fastErr) {
-      logEl.style.display = 'block';
-      logEl.textContent += `Stream copy failed: ${fastErr.message}\n`;
-    }
-  }
-  
-  if (allMP4AndCompatible) {
-    try {
-      updateProgress(0.40, 'Fast TS stream copy...');
-      const blob = await fastFFmpegTSConcat(currentFiles, trackInfos, updateProgress);
-      if (blob && blob.size > 1000) {
-        updateProgress(1.0, `Fast TS stream copy success!`);
-        return blob;
-      }
-    } catch (ncErr) {
-      logEl.style.display = 'block';
-      logEl.textContent += `TS concat failed: ${ncErr.message}\n`;
-    }
-  }
-  
-  if (supportsWebCodecs) {
-    try {
-      updateProgress(0.50, 'Spinning up parallel WebCodecs hardware workers...');
-      const results = await processWithWorkerPool(currentFiles, trackInfos, outWidth, outHeight, updateProgress);
-      const blob = await finalConcatTS(results, updateProgress);
-      updateProgress(1.0, `Parallel hardware encode success!`);
-      return blob;
-    } catch (hwErr) {
-      logEl.style.display = 'block';
-      logEl.textContent += `Hardware pool failed: ${hwErr.message}\n`;
-    }
-  }
-  
-  try {
-    updateProgress(0.70, 'Sequential fast re-encoding...');
-    const blob = await fastSequentialReencode(currentFiles, trackInfos, outWidth, outHeight, updateProgress);
-    if (blob && blob.size > 1000) {
-      updateProgress(1.0, `Sequential fast re-encode success!`);
-      return blob;
-    }
-  } catch (spErr) {
-    logEl.style.display = 'block';
-    logEl.textContent += `Sequential encode failed: ${spErr.message}\n`;
-  }
-  
-  throw new Error('All merging methods failed.');
 }
 
 mergeBtn.addEventListener('click', async () => {
@@ -1738,16 +1524,159 @@ mergeBtn.addEventListener('click', async () => {
   }
 
   const [outWidth, outHeight] = resolution.value.split(':');
+  
+  const updateProgress = (ratio, msg) => {
+    progress.value = Math.min(ratio, 1.0) * 100;
+    statusEl.textContent = msg;
+  };
 
   try {
-    const updateProgress = (ratio, msg) => {
-      progress.value = Math.min(ratio, 1.0) * 100;
-      statusEl.textContent = msg;
-    };
+    updateProgress(0.05, 'Inspecting metadata for instant merge...');
+    let trackInfos = await Promise.all(files.map(f => getTrackInfo(f)));
     
-    updateProgress(0, 'Starting merge process...');
-    // Pass the entire array of files to mergeBatch at once for a continuous pipeline
-    const finalBlob = await mergeBatch(files, outWidth, outHeight, updateProgress);
+    const firstVt = trackInfos[0].videoTrack;
+    const firstAt = trackInfos[0].audioTrack;
+    const firstHasAudio = trackInfos[0].hasAudio;
+    
+    const allMP4AndCompatible = files.every((f, idx) => {
+      const t = trackInfos[idx];
+      if (!t.isMP4 || !t.parsed || !t.hasVideo || !t.videoTrack) return false;
+      if (!firstVt || !firstVt.codec) return false;
+      
+      const isAvc = t.videoTrack.codec && t.videoTrack.codec.startsWith('avc');
+      if (!isAvc) return false;
+      if (t.videoTrack.width !== firstVt.width || t.videoTrack.height !== firstVt.height) return false;
+      
+      if (firstHasAudio) {
+        if (!t.hasAudio || !t.audioTrack) return false;
+        const isAac = t.audioTrack.codec && t.audioTrack.codec.startsWith('mp4a');
+        if (!isAac) return false;
+        if (t.audioTrack.sampleRate !== firstAt.sampleRate) return false;
+        if (t.audioTrack.channels !== firstAt.channels) return false;
+      } else {
+        if (t.hasAudio) return false;
+      }
+      return true;
+    });
+    
+    let finalBlob = null;
+
+    if (allMP4AndCompatible && supportsWebCodecs) {
+       try {
+         updateProgress(0.1, 'Using instant stream copy (no re-encoding)...');
+         const target = new ArrayBufferTarget();
+         const muxer = new Muxer({
+           target,
+           video: { codec: 'avc', width: firstVt.width, height: firstVt.height },
+           audio: firstAt ? { codec: 'aac', numberOfChannels: firstAt.channels, sampleRate: firstAt.sampleRate } : undefined,
+           fastStart: 'in-memory'
+         });
+         let nextVideoTs = 0;
+         let nextAudioTs = 0;
+         
+         for (let fileIdx = 0; fileIdx < files.length; fileIdx++) {
+           updateProgress(0.1 + ((fileIdx + 0.5) / files.length) * 0.8, `Instant remuxing stream copy ${fileIdx + 1}/${files.length}`);
+           const buffer = await readFileSlice(files[fileIdx], 0, files[fileIdx].size);
+           
+           await new Promise((resolve, reject) => {
+             const mp4boxFile = MP4Box.createFile();
+             let videoStartTs = null;
+             let audioStartTs = null;
+             let maxVideoDuration = 0;
+             let maxAudioDuration = 0;
+             let lastVideoTs = nextVideoTs - 1;
+             let lastAudioTs = nextAudioTs - 1;
+             
+             mp4boxFile.onReady = (info) => {
+               const videoTrack = info.tracks.find(t => t.type === 'video');
+               const audioTrack = info.tracks.find(t => t.type === 'audio');
+               if (videoTrack) mp4boxFile.setExtractionOptions(videoTrack.id, null, { nbSamples: 1000000 });
+               if (audioTrack) mp4boxFile.setExtractionOptions(audioTrack.id, null, { nbSamples: 1000000 });
+               
+               mp4boxFile.onSamples = (id, user, samples) => {
+                 if (videoTrack && id === videoTrack.id) {
+                   for (const sample of samples) {
+                     let rawTs = Math.round(sample.cts * 1000000 / sample.timescale);
+                     let dur = Math.round(sample.duration * 1000000 / sample.timescale);
+                     if (videoStartTs === null) videoStartTs = rawTs;
+                     let ts = nextVideoTs + (rawTs - videoStartTs);
+                     if (ts <= lastVideoTs) ts = lastVideoTs + 1000;
+                     lastVideoTs = ts;
+                     let endTs = ts + dur;
+                     if (endTs - nextVideoTs > maxVideoDuration) maxVideoDuration = endTs - nextVideoTs;
+                     try {
+                       muxer.addVideoChunk(new EncodedVideoChunk({ 
+                         type: sample.is_sync ? 'key' : 'delta', 
+                         timestamp: ts, 
+                         duration: dur, 
+                         data: sample.data 
+                       }));
+                     } catch(e) {}
+                   }
+                 } else if (audioTrack && id === audioTrack.id) {
+                   for (const sample of samples) {
+                     let rawTs = Math.round(sample.cts * 1000000 / sample.timescale);
+                     let dur = Math.round(sample.duration * 1000000 / sample.timescale);
+                     if (audioStartTs === null) audioStartTs = rawTs;
+                     let ts = nextAudioTs + (rawTs - audioStartTs);
+                     if (ts <= lastAudioTs) ts = lastAudioTs + 1000;
+                     lastAudioTs = ts;
+                     let endTs = ts + dur;
+                     if (endTs - nextAudioTs > maxAudioDuration) maxAudioDuration = endTs - nextAudioTs;
+                     try {
+                       muxer.addAudioChunk(new EncodedAudioChunk({ 
+                         type: sample.is_sync ? 'key' : 'delta', 
+                         timestamp: ts, 
+                         duration: dur, 
+                         data: sample.data 
+                       }));
+                     } catch(e) {}
+                   }
+                 }
+               };
+               mp4boxFile.start();
+             };
+             mp4boxFile.onError = (e) => reject(e);
+             buffer.fileStart = 0;
+             mp4boxFile.appendBuffer(buffer);
+             mp4boxFile.flush();
+             setTimeout(() => {
+               nextVideoTs += maxVideoDuration;
+               nextAudioTs += maxAudioDuration;
+               resolve();
+             }, 50);
+           });
+         }
+         await muxer.finalize();
+         finalBlob = new Blob([target.buffer], { type: 'video/mp4' });
+         updateProgress(1.0, 'Instant merge completed without re-encoding!');
+       } catch(e) {
+         logEl.style.display = 'block';
+         logEl.textContent += `Instant merge failed: ${e.message}\n`;
+         finalBlob = null;
+       }
+    }
+
+    if (!finalBlob && allMP4AndCompatible) {
+      try {
+         updateProgress(0.1, 'Attempting Fast TS stream copy...');
+         const blob = await fastFFmpegTSConcat(files, trackInfos, (ratio, msg) => {
+           updateProgress(0.1 + ratio * 0.8, msg);
+         });
+         if (blob && blob.size > 1000) {
+           finalBlob = blob;
+           updateProgress(1.0, 'Fast TS stream copy success!');
+         }
+      } catch(e) {
+         logEl.style.display = 'block';
+         logEl.textContent += `Fast TS copy failed: ${e.message}\n`;
+      }
+    }
+    
+    if (!finalBlob) {
+       updateProgress(0.1, 'Using parallel encoding pipeline (max 3 concurrent)...');
+       finalBlob = await parallelPipeline(files, outWidth, outHeight, updateProgress);
+    }
     
     outputBlobUrl = URL.createObjectURL(finalBlob);
     download.href = outputBlobUrl;
