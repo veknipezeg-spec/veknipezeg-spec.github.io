@@ -239,178 +239,9 @@
 
 <script src="https://cdn.jsdelivr.net/npm/mp4box@0.4.4/dist/mp4box.all.min.js" crossorigin="anonymous"></script>
 
-<!-- BUNDLED ESM WORKER CODE TO BYPASS CORS FOR new Worker() -->
-<script id="ffmpeg-worker-code" type="module">
-export const MIME_TYPE_JAVASCRIPT = "text/javascript";
-export const MIME_TYPE_WASM = "application/wasm";
-export const CORE_VERSION = "0.12.6";
-export const CORE_URL = `https://unpkg.com/@ffmpeg/core@${CORE_VERSION}/dist/umd/ffmpeg-core.js`;
-export var FFMessageType;
-(function (FFMessageType) {
-    FFMessageType["LOAD"] = "LOAD";
-    FFMessageType["EXEC"] = "EXEC";
-    FFMessageType["WRITE_FILE"] = "WRITE_FILE";
-    FFMessageType["READ_FILE"] = "READ_FILE";
-    FFMessageType["DELETE_FILE"] = "DELETE_FILE";
-    FFMessageType["RENAME"] = "RENAME";
-    FFMessageType["CREATE_DIR"] = "CREATE_DIR";
-    FFMessageType["LIST_DIR"] = "LIST_DIR";
-    FFMessageType["DELETE_DIR"] = "DELETE_DIR";
-    FFMessageType["ERROR"] = "ERROR";
-    FFMessageType["DOWNLOAD"] = "DOWNLOAD";
-    FFMessageType["PROGRESS"] = "PROGRESS";
-    FFMessageType["LOG"] = "LOG";
-    FFMessageType["MOUNT"] = "MOUNT";
-    FFMessageType["UNMOUNT"] = "UNMOUNT";
-})(FFMessageType || (FFMessageType = {}));
-
-export const ERROR_UNKNOWN_MESSAGE_TYPE = new Error("unknown message type");
-export const ERROR_NOT_LOADED = new Error("ffmpeg is not loaded, call `await ffmpeg.load()` first");
-export const ERROR_TERMINATED = new Error("called FFmpeg.terminate()");
-export const ERROR_IMPORT_FAILURE = new Error("failed to import ffmpeg-core.js");
-
-let ffmpeg;
-const load = async ({ coreURL: _coreURL, wasmURL: _wasmURL, workerURL: _workerURL, }) => {
-    const first = !ffmpeg;
-    try {
-        if (!_coreURL)
-            _coreURL = CORE_URL;
-        // when web worker type is `classic`.
-        importScripts(_coreURL);
-    }
-    catch {
-        if (!_coreURL)
-            _coreURL = CORE_URL.replace('/umd/', '/esm/');
-        // when web worker type is `module`.
-        self.createFFmpegCore = (await import(
-        /* webpackIgnore: true */ /* @vite-ignore */ _coreURL)).default;
-        if (!self.createFFmpegCore) {
-            throw ERROR_IMPORT_FAILURE;
-        }
-    }
-    const coreURL = _coreURL;
-    const wasmURL = _wasmURL ? _wasmURL : _coreURL.replace(/.js$/g, ".wasm");
-    const workerURL = _workerURL
-        ? _workerURL
-        : _coreURL.replace(/.js$/g, ".worker.js");
-    ffmpeg = await self.createFFmpegCore({
-        mainScriptUrlOrBlob: `${coreURL}#${btoa(JSON.stringify({ wasmURL, workerURL }))}`,
-    });
-    ffmpeg.setLogger((data) => self.postMessage({ type: FFMessageType.LOG, data }));
-    ffmpeg.setProgress((data) => self.postMessage({
-        type: FFMessageType.PROGRESS,
-        data,
-    }));
-    return first;
-};
-const exec = ({ args, timeout = -1 }) => {
-    ffmpeg.setTimeout(timeout);
-    ffmpeg.exec(...args);
-    const ret = ffmpeg.ret;
-    ffmpeg.reset();
-    return ret;
-};
-const writeFile = ({ path, data }) => {
-    ffmpeg.FS.writeFile(path, data);
-    return true;
-};
-const readFile = ({ path, encoding }) => ffmpeg.FS.readFile(path, { encoding });
-const deleteFile = ({ path }) => {
-    ffmpeg.FS.unlink(path);
-    return true;
-};
-const rename = ({ oldPath, newPath }) => {
-    ffmpeg.FS.rename(oldPath, newPath);
-    return true;
-};
-const createDir = ({ path }) => {
-    ffmpeg.FS.mkdir(path);
-    return true;
-};
-const listDir = ({ path }) => {
-    const names = ffmpeg.FS.readdir(path);
-    const nodes = [];
-    for (const name of names) {
-        const stat = ffmpeg.FS.stat(`${path}/${name}`);
-        const isDir = ffmpeg.FS.isDir(stat.mode);
-        nodes.push({ name, isDir });
-    }
-    return nodes;
-};
-const deleteDir = ({ path }) => {
-    ffmpeg.FS.rmdir(path);
-    return true;
-};
-const mount = ({ fsType, options, mountPoint }) => {
-    const str = fsType;
-    const fs = ffmpeg.FS.filesystems[str];
-    if (!fs)
-        return false;
-    ffmpeg.FS.mount(fs, options, mountPoint);
-    return true;
-};
-const unmount = ({ mountPoint }) => {
-    ffmpeg.FS.unmount(mountPoint);
-    return true;
-};
-self.onmessage = async ({ data: { id, type, data: _data }, }) => {
-    const trans = [];
-    let data;
-    try {
-        if (type !== FFMessageType.LOAD && !ffmpeg)
-            throw ERROR_NOT_LOADED; // eslint-disable-line
-        switch (type) {
-            case FFMessageType.LOAD:
-                data = await load(_data);
-                break;
-            case FFMessageType.EXEC:
-                data = exec(_data);
-                break;
-            case FFMessageType.WRITE_FILE:
-                data = writeFile(_data);
-                break;
-            case FFMessageType.READ_FILE:
-                data = readFile(_data);
-                break;
-            case FFMessageType.DELETE_FILE:
-                data = deleteFile(_data);
-                break;
-            case FFMessageType.RENAME:
-                data = rename(_data);
-                break;
-            case FFMessageType.CREATE_DIR:
-                data = createDir(_data);
-                break;
-            case FFMessageType.LIST_DIR:
-                data = listDir(_data);
-                break;
-            case FFMessageType.DELETE_DIR:
-                data = deleteDir(_data);
-                break;
-            case FFMessageType.MOUNT:
-                data = mount(_data);
-                break;
-            case FFMessageType.UNMOUNT:
-                data = unmount(_data);
-                break;
-            default:
-                throw ERROR_UNKNOWN_MESSAGE_TYPE;
-        }
-    }
-    catch (e) {
-        self.postMessage({
-            id,
-            type: FFMessageType.ERROR,
-            data: e.toString(),
-        });
-        return;
-    }
-    if (data instanceof Uint8Array) {
-        trans.push(data.buffer);
-    }
-    self.postMessage({ id, type, data }, trans);
-};
-</script>
+<!-- FFmpeg wrapper (UMD build). Browsers refuse to create a Worker from a cross-origin URL, so loadFFmpeg()
+     downloads the wrapper worker + core and hands FFmpeg same-origin blob: URLs instead. -->
+<script src="https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js" crossorigin="anonymous"></script>
 
 </head>
 <body>
@@ -986,8 +817,6 @@ self.onmessage = async (e) => {
 </script>
 
 <script type="module">
-import { FFmpeg } from 'https://esm.sh/@ffmpeg/ffmpeg@0.12.10';
-import { toBlobURL } from 'https://esm.sh/@ffmpeg/util@0.12.2';
 
 const supportsWebCodecs = 'VideoEncoder' in window && 'VideoDecoder' in window && 'AudioEncoder' in window && 'AudioDecoder' in window;
 const isAndroid = /Android/i.test(navigator.userAgent) || /Mobile/i.test(navigator.userAgent);
@@ -1001,7 +830,6 @@ if ('serviceWorker' in navigator) {
 }
 
 const webCodecsWorkerCode = document.getElementById('webcodecs-worker-code').textContent;
-const ffmpegWorkerCode = document.getElementById('ffmpeg-worker-code').textContent;
 
 let files = [];
 let outputBlobUrl = null;
@@ -1051,10 +879,46 @@ let ffmpegLoaded = false;
 let ffmpegLock = Promise.resolve();
 let currentFallbackMsg = '';
 
+const FFMPEG_VER = '0.12.10';
+const CORE_VER = '0.12.6';
+const CDN = 'https://cdn.jsdelivr.net/npm';
+const blobCache = new Map();
+
+// Download a file once and return a same-origin blob: URL (Workers/imports can't use cross-origin URLs directly)
+async function toBlobURL(url, mime) {
+  if (blobCache.has(url)) return blobCache.get(url);
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Could not download ${url} (HTTP ${res.status})`);
+  const blobUrl = URL.createObjectURL(new Blob([await res.arrayBuffer()], { type: mime }));
+  blobCache.set(url, blobUrl);
+  return blobUrl;
+}
+
+function createFFmpeg() {
+  const FFmpegClass = window.FFmpegWASM && window.FFmpegWASM.FFmpeg;
+  if (!FFmpegClass) throw new Error('ffmpeg.js did not load from the CDN (network problem or ad-blocker)');
+  const inst = new FFmpegClass();
+  inst.on('log', ({ message }) => {
+    logEl.style.display = 'block';
+    const line = document.createElement('div');
+    line.textContent = message;
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+  });
+  inst.on('progress', ({ progress: p }) => {
+    const percent = Math.min(100, Math.max(0, p * 100));
+    progress.value = percent;
+    if (currentFallbackMsg) {
+      statusEl.textContent = `${currentFallbackMsg} (${percent.toFixed(0)}%)`;
+    }
+  });
+  return inst;
+}
+
 async function getFFmpeg() {
   if (!ffmpeg) {
     try {
-      ffmpeg = new FFmpeg();
+      ffmpeg = createFFmpeg();
     } catch (e) {
       throw new Error('Failed to initialize FFmpeg: ' + getErrorMessage(e));
     }
@@ -1064,57 +928,45 @@ async function getFFmpeg() {
 
 async function loadFFmpeg() {
   if (ffmpegLoaded) return;
-  
-  const ffmpegInstance = await getFFmpeg();
   statusEl.textContent = 'Loading FFmpeg engine...';
 
-  ffmpegInstance.on('log', ({ message }) => {
-    logEl.style.display = 'block';
-    const line = document.createElement('div');
-    line.textContent = message;
-    logEl.appendChild(line);
-    logEl.scrollTop = logEl.scrollHeight;
-  });
+  // Multi-threaded core needs SharedArrayBuffer, i.e. a cross-origin-isolated page (COOP/COEP headers in netlify.toml).
+  // Where that's unavailable (e.g. Safari), fall back to the single-threaded core automatically.
+  const canMT = self.crossOriginIsolated === true && typeof SharedArrayBuffer !== 'undefined';
+  const cores = canMT ? ['core-mt', 'core'] : ['core'];
+  let lastErr;
 
-  ffmpegInstance.on('progress', ({ progress: p }) => {
-    const percent = Math.min(100, Math.max(0, p * 100));
-    progress.value = percent;
-    if (currentFallbackMsg) {
-        statusEl.textContent = `${currentFallbackMsg} (${percent.toFixed(0)}%)`;
+  for (const pkg of cores) {
+    const mt = pkg === 'core-mt';
+    try {
+      statusEl.textContent = mt ? 'Loading FFmpeg (Multi-Threaded Mode)...' : 'Loading FFmpeg (Single-Threaded Mode)...';
+      const inst = await getFFmpeg();
+      const base = `${CDN}/@ffmpeg/${pkg}@${CORE_VER}/dist/umd`;
+      const cfg = {
+        // The wrapper worker is what the browser was refusing to start straight from the CDN
+        classWorkerURL: await toBlobURL(`${CDN}/@ffmpeg/ffmpeg@${FFMPEG_VER}/dist/umd/814.ffmpeg.js`, 'text/javascript'),
+        coreURL: await toBlobURL(`${base}/ffmpeg-core.js`, 'text/javascript'),
+        wasmURL: await toBlobURL(`${base}/ffmpeg-core.wasm`, 'application/wasm'),
+      };
+      if (mt) cfg.workerURL = await toBlobURL(`${base}/ffmpeg-core.worker.js`, 'text/javascript');
+      await inst.load(cfg);
+
+      ffmpegLoaded = true;
+      statusEl.textContent = mt ? 'FFmpeg ready (Multi-Threaded & High Performance)' : 'FFmpeg ready';
+      console.log(`Loaded FFmpeg ${pkg}`);
+      return;
+    } catch (err) {
+      lastErr = err;
+      console.warn(`FFmpeg ${pkg} failed to load:`, err);
+      try { if (ffmpeg) ffmpeg.terminate(); } catch (_) {}
+      ffmpeg = null;
     }
-  });
-
-  // Create the bundled ES Module worker as a local Blob URL
-  // This bypasses CORS restrictions for new Worker()
-  const ffmpegWorkerBlob = new Blob([ffmpegWorkerCode], { type: 'text/javascript' });
-  const ffmpegWorkerURL = URL.createObjectURL(ffmpegWorkerBlob);
-
-  // Use the Multi-Threaded ESM core for maximum performance
-  // This requires Cross-Origin-Opener-Policy and Cross-Origin-Embedder-Policy headers!
-  const baseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core-mt@0.12.6/dist/esm';
-  
-  try {
-    statusEl.textContent = 'Loading FFmpeg (Multi-Threaded Mode)...';
-    await ffmpegInstance.load({
-      coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
-      wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
-      workerURL: await toBlobURL(`${baseURL}/ffmpeg-core.worker.js`, 'text/javascript'), // Crucial for core-mt!
-      classWorkerURL: ffmpegWorkerURL // Crucial to bypass CDN CORS for the wrapper worker
-    });
-    
-    URL.revokeObjectURL(ffmpegWorkerURL);
-    
-    ffmpegLoaded = true;
-    statusEl.textContent = 'FFmpeg ready (Multi-Threaded & High Performance)';
-    console.log("Loaded Multi-Threaded FFmpeg Core");
-    
-  } catch (stErr) {
-    URL.revokeObjectURL(ffmpegWorkerURL);
-    statusEl.textContent = 'Failed to load FFmpeg: ' + getErrorMessage(stErr);
-    logEl.style.display = 'block';
-    logEl.textContent = getErrorMessage(stErr) + '\n\n' + (stErr.stack || '');
-    throw new Error('FFmpeg library failed to load from CDN. Check internet connection or adblocker.');
   }
+
+  statusEl.textContent = 'Failed to load FFmpeg: ' + getErrorMessage(lastErr);
+  logEl.style.display = 'block';
+  logEl.textContent = getErrorMessage(lastErr) + '\n\n' + ((lastErr && lastErr.stack) || '');
+  throw new Error('FFmpeg failed to load: ' + getErrorMessage(lastErr));
 }
 
 function showPage(pageName) {
