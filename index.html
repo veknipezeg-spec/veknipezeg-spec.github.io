@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="build-id" content="2026-10-28-r3-selfcontained-ffmpeg">
 <title>Universal Video Merger - Free Online Tool to Combine Videos</title>
 <meta name="description" content="Merge unlimited videos of any format, codec, or resolution online for free. No upload, no watermarks, works directly in your browser.">
 
@@ -1000,6 +1001,9 @@ if ('serviceWorker' in navigator) {
 
 const webCodecsWorkerCode = document.getElementById('webcodecs-worker-code').textContent;
 const ffmpegWorkerCode = document.getElementById('ffmpeg-worker-code').textContent;
+const BUILD_ID = (document.querySelector('meta[name="build-id"]') || {}).content || 'unknown';
+window.__VIDEO_MERGER_BUILD__ = BUILD_ID;
+console.info('[Video Merger] build ' + BUILD_ID);
 
 let files = [];
 let outputBlobUrl = null;
@@ -1292,8 +1296,8 @@ async function doLoadFFmpeg() {
     }
   }
   logEl.style.display = 'block';
-  logEl.textContent += 'FFmpeg engine failed to load:\n' + problems.map(p => ' - ' + p).join('\n') + '\n';
-  throw new Error('FFmpeg engine failed to load. Check your connection / ad-blocker (cdn.jsdelivr.net, unpkg.com) and reload. Details are in the log.');
+  logEl.textContent += `FFmpeg engine failed to load (build ${BUILD_ID}):\n` + problems.map(p => ' - ' + p).join('\n') + '\n';
+  throw new Error(`FFmpeg engine failed to load (build ${BUILD_ID}). Check your connection / ad-blocker (cdn.jsdelivr.net, unpkg.com) and reload. Details are in the log.`);
 }
 
 function loadFFmpeg() {
