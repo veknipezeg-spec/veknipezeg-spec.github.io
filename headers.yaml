@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: universal-video-merger
+    runtime: static
+    headers:
+      - path: /*
+        name: Cross-Origin-Opener-Policy
+        value: same-origin
+      - path: /*
+        name: Cross-Origin-Embedder-Policy
+        value: credentialless
